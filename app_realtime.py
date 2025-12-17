@@ -21,7 +21,6 @@ st.markdown("""
 <style>
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
     .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #f5c2c7; display: inline-block; }
-    .css-1r6slb0 { border: 1px solid #e0e0e0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
     div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
     h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #444; }
 </style>
@@ -31,8 +30,9 @@ MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-REFRESH_RATE = 2  # Refresh nhanh (2s) để thấy hiệu ứng trôi
+REFRESH_RATE = 2  # Refresh nhanh
 
+# Lấy Secrets
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -78,24 +78,21 @@ def get_action(speed):
     if speed > 10000: return "Kiểm tra biến tần"
     return "Bôi trơn trục"
 
-def get_recent_data(limit=1000): # Lấy nhiều data để vẽ đủ lịch sử
+def get_recent_data(limit=1000): 
     try:
         response = supabase.table("sensor_data").select("*").order("time", desc=True).limit(limit).execute()
         df = pd.DataFrame(response.data)
         if not df.empty:
-            # Xử lý thời gian chuẩn xác
             df['time'] = pd.to_datetime(df['time'], utc=True)
             df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
-            
-            # Lấy data trong 12h qua để đảm bảo liền mạch
-            cutoff_time = datetime.now() - timedelta(hours=12)
+            # Lấy data 24h
+            cutoff_time = datetime.now() - timedelta(hours=24)
             df = df[df['time'] > cutoff_time]
-            
         return df
     except: return pd.DataFrame()
 
 # ===============================================================
-# 2. UI COMPONENTS (GAUGE & CHART)
+# 2. UI COMPONENTS
 # ===============================================================
 
 def create_gauge(value, title, max_val=300, color="green"):
@@ -113,57 +110,44 @@ def create_gauge(value, title, max_val=300, color="green"):
     fig.update_layout(height=200, margin=dict(t=40,b=10,l=25,r=25))
     return fig
 
-# --- LOGIC BIỂU ĐỒ: GROWING -> SCROLLING ---
+# --- LOGIC BIỂU ĐỒ V6: AUTO-SCROLL BẰNG CÁCH CẮT DATA ---
 def create_trend_chart(df, dev_name):
+    # Thay vì khóa trục, ta cắt dữ liệu đầu vào.
+    # Lấy dữ liệu trong 30 phút gần nhất tính từ điểm dữ liệu cuối cùng (hoặc hiện tại)
+    
     fig = go.Figure()
     
-    # Cấu hình trục X mặc định (Growing Mode)
-    xaxis_config = dict(
-        showgrid=False, 
-        tickformat='%H:%M:%S',
-    )
-    
-    title_text = "Lịch sử vận hành"
-
     if not df.empty:
-        # 1. Xác định thời lượng dữ liệu đang có
-        min_time = df['time'].min()
-        max_time = df['time'].max()
-        duration = (max_time - min_time).total_seconds() / 60 # phút
+        # Xác định điểm mốc thời gian mới nhất (để tránh bị trắng nếu worker chậm)
+        latest_time = df['time'].max()
+        # Khung nhìn: 30 phút trước điểm mới nhất
+        window_start = latest_time - timedelta(minutes=30)
         
-        # 2. Chọn chế độ hiển thị
-        if duration < 15:
-            # CHẾ ĐỘ GROWING: Ít hơn 15p -> Để tự động co giãn (Auto Range)
-            # Biểu đồ sẽ "dài ra" từ từ theo dữ liệu
-            title_text = f"Lịch sử vận hành (Tích lũy {int(duration)} phút)"
-        else:
-            # CHẾ ĐỘ SCROLLING: Nhiều hơn 15p -> Khóa khung nhìn 15p cuối
-            # Biểu đồ sẽ "trôi"
-            now_vn = datetime.utcnow() + timedelta(hours=7)
-            xaxis_config.update(dict(
-                range=[now_vn - timedelta(minutes=15), now_vn], # Khóa khung 15p
-                fixedrange=True
-            ))
-            title_text = "Lịch sử vận hành (Live Scroll - 15p gần nhất)"
-
+        # Lọc dữ liệu
+        df_view = df[df['time'] >= window_start]
+        
         # Vẽ đường
         fig.add_trace(go.Scatter(
-            x=df['time'], y=df['Speed'],
-            fill='tozeroy', mode='lines', # Dùng line cho mượt
+            x=df_view['time'], y=df_view['Speed'],
+            fill='tozeroy', mode='lines', 
             line=dict(width=2, color='#0ea5e9'),
             fillcolor='rgba(14, 165, 233, 0.1)',
             name='Tốc độ'
         ))
         fig.add_trace(go.Scatter(
-            x=df['time'], y=df['Temp'],
+            x=df_view['time'], y=df_view['Temp'],
             mode='lines', line=dict(color='#f97316', dash='dot', width=2),
             yaxis='y2', name='Nhiệt độ'
         ))
     
     fig.update_layout(
-        title=dict(text=title_text, font=dict(size=14, color="#555")),
+        title=dict(text="Lịch sử vận hành (30p gần nhất)", font=dict(size=14, color="#555")),
         height=250, margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=xaxis_config,
+        xaxis=dict(
+            showgrid=False, 
+            tickformat='%H:%M:%S',
+            # ĐỂ TỰ ĐỘNG (AUTORANGE) -> Growing & Scrolling tự nhiên
+        ),
         yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0', range=[0, 350]),
         yaxis2=dict(title="Temp (°C)", overlaying='y', side='right', showgrid=False, range=[0, 60]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -176,11 +160,10 @@ def create_trend_chart(df, dev_name):
 # ===============================================================
 def render_realtime_tab():
     now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
-    st.caption(f"Last update: {now_str} | Mode: Auto-Smart Chart")
+    st.caption(f"Last update: {now_str}")
     
     @st.fragment(run_every=REFRESH_RATE)
     def update_loop():
-        # Lấy đủ data để vẽ lịch sử dài
         df_all = get_recent_data(1000)
         
         col1, col2 = st.columns(2)
@@ -224,7 +207,7 @@ def render_realtime_tab():
                     m3.metric("AI Score", f"{score:.2f}")
 
                     st.markdown("---")
-                    # GỌI BIỂU ĐỒ THÔNG MINH (GROWING -> SCROLLING)
+                    # GỌI BIỂU ĐỒ V6
                     fig_trend = create_trend_chart(df, dev)
                     st.plotly_chart(fig_trend, use_container_width=True, key=f"trend_{dev}")
 
@@ -237,10 +220,10 @@ def render_realtime_tab():
     update_loop()
 
 # ===============================================================
-# 4. REPORT TAB (DONUT CHART + HISTOGRAM)
+# 4. REPORT TAB (SCATTER PLOT THEO YÊU CẦU)
 # ===============================================================
 def render_analytics_tab():
-    st.header("📊 Báo cáo Hiệu suất & OEE")
+    st.header("📊 Báo cáo Hiệu suất")
     
     col1, col2 = st.columns([1, 3])
     with col1:
@@ -253,12 +236,11 @@ def render_analytics_tab():
         df = pd.DataFrame(response.data)
         
         if df.empty:
-            st.warning("Chưa có dữ liệu để phân tích.")
+            st.warning("Chưa có dữ liệu.")
             return
             
         df['time'] = pd.to_datetime(df['time'], utc=True).dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
-        df.set_index('time', inplace=True)
-
+        
         # KPI
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Tốc độ TB", f"{df['Speed'].mean():.1f}")
@@ -268,7 +250,7 @@ def render_analytics_tab():
         
         st.markdown("---")
 
-        # 1. BIỂU ĐỒ DONUT (Trạng thái)
+        # 1. DONUT CHART (Trạng thái)
         conditions = [(df['Speed'] == 0), (df['Speed'] > 0) & (df['Speed'] <= 150), (df['Speed'] > 150)]
         choices = ['Dừng (Idle)', 'Hoạt động (Running)', 'Quá tải (Overload)']
         df['State'] = np.select(conditions, choices, default='Không rõ')
@@ -286,11 +268,15 @@ def render_analytics_tab():
         with c2:
             st.dataframe(state_counts, use_container_width=True, hide_index=True)
 
-        # 2. BIỂU ĐỒ HISTOGRAM (Phân bố tốc độ)
-        st.subheader("📊 Phân bố Tốc độ")
-        fig_hist = px.histogram(df, x="Speed", nbins=30, color_discrete_sequence=['#3498db'])
-        fig_hist.update_layout(height=300, bargap=0.1)
-        st.plotly_chart(fig_hist, use_container_width=True)
+        # 2. SCATTER PLOT (PHÂN BỐ TỐC ĐỘ) - THAY CHO HISTOGRAM
+        st.subheader("📊 Phân bố Tốc độ (Scatter Detail)")
+        # Vẽ từng điểm dữ liệu để thấy sự phân tán
+        fig_scatter = px.scatter(df, x="time", y="Speed", color="State",
+                                 color_discrete_map={'Dừng (Idle)': 'gray', 'Hoạt động (Running)': 'green', 'Quá tải (Overload)': 'red'},
+                                 title="Chi tiết các điểm vận hành theo thời gian")
+        fig_scatter.update_traces(marker=dict(size=6, opacity=0.7))
+        fig_scatter.update_layout(height=400, xaxis_title="Thời gian", yaxis_title="Tốc độ (sp/p)")
+        st.plotly_chart(fig_scatter, use_container_width=True)
 
     except Exception as e:
         st.error(f"Lỗi tải báo cáo: {e}")
