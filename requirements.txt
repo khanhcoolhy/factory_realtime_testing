@@ -1,0 +1,10 @@
+streamlit
+pandas
+plotly
+numpy
+torch
+joblib
+supabase
+openmeteo_requests
+requests_cache
+retry_requests
