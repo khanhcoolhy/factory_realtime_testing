@@ -83,7 +83,10 @@ def get_recent_data(limit=1000):
         response = supabase.table("sensor_data").select("*").order("time", desc=True).limit(limit).execute()
         df = pd.DataFrame(response.data)
         if not df.empty:
-            df['time'] = pd.to_datetime(df['time'], utc=True)
+            # --- FIX LỖI TIME DATA ---
+            # Thêm format='mixed' để xử lý cả dữ liệu có mili-giây và không có
+            df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
+            
             df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
             # Lấy data 24h
             cutoff_time = datetime.now() - timedelta(hours=24)
@@ -112,13 +115,10 @@ def create_gauge(value, title, max_val=300, color="green"):
 
 # --- LOGIC BIỂU ĐỒ V6: AUTO-SCROLL BẰNG CÁCH CẮT DATA ---
 def create_trend_chart(df, dev_name):
-    # Thay vì khóa trục, ta cắt dữ liệu đầu vào.
-    # Lấy dữ liệu trong 30 phút gần nhất tính từ điểm dữ liệu cuối cùng (hoặc hiện tại)
-    
     fig = go.Figure()
     
     if not df.empty:
-        # Xác định điểm mốc thời gian mới nhất (để tránh bị trắng nếu worker chậm)
+        # Xác định điểm mốc thời gian mới nhất
         latest_time = df['time'].max()
         # Khung nhìn: 30 phút trước điểm mới nhất
         window_start = latest_time - timedelta(minutes=30)
@@ -143,11 +143,7 @@ def create_trend_chart(df, dev_name):
     fig.update_layout(
         title=dict(text="Lịch sử vận hành (30p gần nhất)", font=dict(size=14, color="#555")),
         height=250, margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(
-            showgrid=False, 
-            tickformat='%H:%M:%S',
-            # ĐỂ TỰ ĐỘNG (AUTORANGE) -> Growing & Scrolling tự nhiên
-        ),
+        xaxis=dict(showgrid=False, tickformat='%H:%M:%S'),
         yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0', range=[0, 350]),
         yaxis2=dict(title="Temp (°C)", overlaying='y', side='right', showgrid=False, range=[0, 60]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -238,8 +234,12 @@ def render_analytics_tab():
         if df.empty:
             st.warning("Chưa có dữ liệu.")
             return
-            
-        df['time'] = pd.to_datetime(df['time'], utc=True).dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
+        
+        # --- FIX LỖI TIME DATA ---
+        # Thêm format='mixed' để xử lý cả dữ liệu có mili-giây và không có
+        df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
+        
+        df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
         
         # KPI
         k1, k2, k3, k4 = st.columns(4)
@@ -268,9 +268,8 @@ def render_analytics_tab():
         with c2:
             st.dataframe(state_counts, use_container_width=True, hide_index=True)
 
-        # 2. SCATTER PLOT (PHÂN BỐ TỐC ĐỘ) - THAY CHO HISTOGRAM
+        # 2. SCATTER PLOT (PHÂN BỐ TỐC ĐỘ)
         st.subheader("📊 Phân bố Tốc độ (Scatter Detail)")
-        # Vẽ từng điểm dữ liệu để thấy sự phân tán
         fig_scatter = px.scatter(df, x="time", y="Speed", color="State",
                                  color_discrete_map={'Dừng (Idle)': 'gray', 'Hoạt động (Running)': 'green', 'Quá tải (Overload)': 'red'},
                                  title="Chi tiết các điểm vận hành theo thời gian")
