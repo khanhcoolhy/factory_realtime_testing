@@ -17,6 +17,7 @@ from supabase import create_client
 # ===============================================================
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
+# CSS Tùy chỉnh (Giữ nguyên giao diện đẹp)
 st.markdown("""
 <style>
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
@@ -31,15 +32,16 @@ MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-REFRESH_RATE = 2  # Refresh nhanh để thấy hiệu ứng trôi
+REFRESH_RATE = 5 
 
+# Lấy Secrets
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
     TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
 except:
-    st.error("❌ Thiếu cấu hình Secrets!")
+    st.error("❌ Thiếu cấu hình Secrets! Vui lòng kiểm tra lại.")
     st.stop()
 
 @st.cache_resource
@@ -78,19 +80,29 @@ def get_action(speed):
     if speed > 10000: return "Kiểm tra biến tần / Bộ điều khiển"
     return "Kiểm tra trục động cơ / Bôi trơn"
 
-def get_recent_data(limit=500):
+# --- HÀM LẤY DATA (ĐÃ SỬA LỖI TIMEZONE) ---
+def get_recent_data(limit=100):
     try:
+        # Lấy dữ liệu mới nhất
         response = supabase.table("sensor_data").select("*").order("time", desc=True).limit(limit).execute()
         df = pd.DataFrame(response.data)
+        
         if not df.empty:
-            # Chuyển đổi chuẩn xác về giờ VN
+            # FIX LỖI: Luôn ép về UTC trước khi convert sang giờ VN
+            # Điều này giúp xử lý cả dữ liệu cũ (có múi giờ) và mới (không có)
             df['time'] = pd.to_datetime(df['time'], utc=True)
             df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
+            
+            # QUAN TRỌNG: Chỉ lấy dữ liệu trong 24h qua để tránh nối nét vẽ với dữ liệu cũ mèm
+            cutoff_time = datetime.now() - timedelta(hours=24)
+            df = df[df['time'] > cutoff_time]
+            
         return df
-    except: return pd.DataFrame()
+    except Exception as e: 
+        return pd.DataFrame()
 
 # ===============================================================
-# 2. UI COMPONENTS
+# 2. UI COMPONENTS (CHARTS)
 # ===============================================================
 
 def create_gauge(value, title, max_val=300, color="green"):
@@ -118,44 +130,34 @@ def create_gauge(value, title, max_val=300, color="green"):
     return fig
 
 def create_trend_chart(df, dev_name):
-    # --- FIX LỖI TIMEZONE ---
-    # Lấy giờ hiện tại theo giờ VN (UTC+7) để khớp với dữ liệu
-    now_vn = datetime.utcnow() + timedelta(hours=7)
-    x_range = [now_vn - timedelta(minutes=15), now_vn] 
+    # Nếu ít dữ liệu quá thì tạo điểm giả để biểu đồ không bị méo
+    if len(df) < 2:
+        fig = go.Figure()
+        fig.update_layout(
+            title=dict(text="Đang chờ thêm dữ liệu...", font=dict(size=14, color="#555")),
+            height=250, xaxis=dict(showgrid=False), yaxis=dict(showgrid=True)
+        )
+        return fig
 
     fig = go.Figure()
-    
-    if not df.empty:
-        # Lọc dữ liệu trong khoảng vẽ để tối ưu
-        mask = (df['time'] >= x_range[0]) & (df['time'] <= x_range[1])
-        plot_df = df.loc[mask]
-        
-        # Nếu không có dữ liệu trong 15p qua (do worker chưa chạy), lấy điểm cuối cùng nối vào để không bị trắng
-        if plot_df.empty and not df.empty:
-             plot_df = df.head(1) 
-
-        fig.add_trace(go.Scatter(
-            x=plot_df['time'], y=plot_df['Speed'],
-            fill='tozeroy', mode='lines', # Bỏ marker, chỉ dùng line cho mượt
-            line=dict(width=2, color='#0ea5e9'),
-            fillcolor='rgba(14, 165, 233, 0.1)',
-            name='Tốc độ'
-        ))
-        fig.add_trace(go.Scatter(
-            x=plot_df['time'], y=plot_df['Temp'],
-            mode='lines', line=dict(color='#f97316', dash='dot', width=2),
-            yaxis='y2', name='Nhiệt độ'
-        ))
+    fig.add_trace(go.Scatter(
+        x=df['time'], y=df['Speed'],
+        fill='tozeroy', mode='lines+markers', # Thêm markers để dễ nhìn điểm
+        line=dict(width=2, color='#0ea5e9'),
+        fillcolor='rgba(14, 165, 233, 0.1)',
+        name='Tốc độ'
+    ))
+    fig.add_trace(go.Scatter(
+        x=df['time'], y=df['Temp'],
+        mode='lines', line=dict(color='#f97316', dash='dot', width=2),
+        yaxis='y2', name='Nhiệt độ'
+    ))
     
     fig.update_layout(
-        title=dict(text="Diễn biến 15 phút qua (Live)", font=dict(size=14, color="#555")),
+        title=dict(text="Lịch sử vận hành (Real-time)", font=dict(size=14, color="#555")),
         height=250,
         margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(
-            showgrid=False, tickformat='%H:%M:%S',
-            range=x_range,    # Khóa trục X theo giờ VN
-            fixedrange=True   # Không cho zoom
-        ),
+        xaxis=dict(showgrid=False, tickformat='%H:%M:%S'),
         yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0', range=[0, 350]),
         yaxis2=dict(title="Temp (°C)", overlaying='y', side='right', showgrid=False, range=[0, 60]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -168,27 +170,27 @@ def create_trend_chart(df, dev_name):
 # 3. REAL-TIME TAB LOGIC
 # ===============================================================
 def render_realtime_tab():
-    # Hiển thị giờ VN
-    now_vn_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
-    st.caption(f"Last update: {now_vn_str} | Auto-scroll: ON")
+    st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')} | Auto-refresh: 5s")
     
     @st.fragment(run_every=REFRESH_RATE)
     def update_loop():
-        # Lấy 500 điểm để đảm bảo đủ dữ liệu vẽ đường
-        df_all = get_recent_data(500)
+        # Lấy dữ liệu 24h gần nhất
+        df_all = get_recent_data(200)
         
         col1, col2 = st.columns(2)
         cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
 
+        # Nếu không có dữ liệu mới, hiển thị thông báo
         if df_all.empty:
             for dev in DEVICES:
-                with cols_map[dev]: st.warning("⏳ Đang chờ Worker bơm dữ liệu...")
+                with cols_map[dev]:
+                    st.warning("⏳ Đang chờ Worker bơm dữ liệu mới (5 phút/lần)...")
             return
 
         for dev in DEVICES:
             df = df_all[df_all['DevAddr'] == dev].sort_values('time')
             if df.empty: 
-                with cols_map[dev]: st.info("Chưa có dữ liệu.")
+                with cols_map[dev]: st.info("Chưa có dữ liệu cho máy này.")
                 continue
             
             last = df.iloc[-1]
@@ -257,7 +259,7 @@ def render_realtime_tab():
     update_loop()
 
 # ===============================================================
-# 4. REPORT TAB (ĐÃ KHÔI PHỤC CODE CŨ CỦA BẠN)
+# 4. REPORT TAB (CẢI TIẾN)
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất")
