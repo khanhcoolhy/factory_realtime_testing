@@ -13,18 +13,22 @@ from datetime import datetime, timedelta
 from supabase import create_client
 
 # ===============================================================
-# 1. CẤU HÌNH & KẾT NỐI (GIỮ NGUYÊN)
+# 1. CẤU HÌNH & KẾT NỐI (LOGIC CŨ - GIỮ NGUYÊN)
 # ===============================================================
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# --- CSS TÙY CHỈNH CHO GIAO DIỆN CÔNG NGHIỆP ---
+# --- CSS TÙY CHỈNH CHO GIAO DIỆN ĐẸP HƠN ---
 st.markdown("""
 <style>
     /* Status Badges */
-    .status-ok { background-color: #d4edda; color: #155724; padding: 5px 15px; border-radius: 20px; font-weight: bold; text-align: center; border: 1px solid #c3e6cb; }
-    .status-err { background-color: #f8d7da; color: #721c24; padding: 5px 15px; border-radius: 20px; font-weight: bold; text-align: center; border: 1px solid #f5c6cb; }
-    /* Metric Card styling */
-    div[data-testid="stMetric"] { background-color: #ffffff; border: 1px solid #e0e0e0; padding: 10px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+    .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
+    .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #f5c2c7; display: inline-block; }
+    /* Card Styling */
+    .css-1r6slb0 { border: 1px solid #e0e0e0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    /* Metric Value */
+    div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
+    /* Headers */
+    h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #444; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -34,13 +38,14 @@ CONFIG_PATH = "model_config_v2.pkl"
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
 REFRESH_RATE = 5 
 
+# Lấy Secrets
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
     TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
 except:
-    st.error("❌ Thiếu cấu hình Secrets!")
+    st.error("❌ Thiếu cấu hình Secrets! Vui lòng kiểm tra lại.")
     st.stop()
 
 @st.cache_resource
@@ -93,60 +98,58 @@ def get_recent_data(limit=200):
 # 2. UI COMPONENTS (CHARTS MỚI - ĐẸP HƠN)
 # ===============================================================
 
-# 
-
-# Biểu đồ Đồng hồ (Gauge) cho Tốc độ
+# Biểu đồ Đồng hồ (Gauge)
 def create_gauge(value, title, max_val=300, color="green"):
     fig = go.Figure(go.Indicator(
         mode = "gauge+number",
         value = value,
-        title = {'text': title, 'font': {'size': 20}},
+        title = {'text': title, 'font': {'size': 18, 'color': '#555'}},
         gauge = {
             'axis': {'range': [None, max_val], 'tickwidth': 1, 'tickcolor': "darkblue"},
             'bar': {'color': color},
             'bgcolor': "white",
-            'borderwidth': 2,
-            'bordercolor': "gray",
+            'borderwidth': 1,
+            'bordercolor': "#ddd",
             'steps': [
-                {'range': [0, max_val*0.3], 'color': '#e8f5e9'},
-                {'range': [max_val*0.3, max_val*0.7], 'color': '#c8e6c9'},
-                {'range': [max_val*0.7, max_val], 'color': '#a5d6a7'}],
+                {'range': [0, max_val*0.3], 'color': '#f0fff4'},
+                {'range': [max_val*0.3, max_val*0.7], 'color': '#dcfce7'},
+                {'range': [max_val*0.7, max_val], 'color': '#bbf7d0'}],
             'threshold': {
                 'line': {'color': "red", 'width': 4},
                 'thickness': 0.75,
                 'value': max_val * 0.9}
         }
     ))
-    fig.update_layout(height=220, margin=dict(t=40,b=10,l=20,r=20))
+    fig.update_layout(height=200, margin=dict(t=40,b=10,l=25,r=25))
     return fig
 
-# 
-# Biểu đồ Lịch sử dạng Vùng (Area Chart) - Nhìn chuyên nghiệp hơn Line
+# Biểu đồ Lịch sử dạng Vùng (Area Chart)
 def create_trend_chart(df, dev_name):
     fig = go.Figure()
     # Vẽ vùng Speed
     fig.add_trace(go.Scatter(
         x=df['time'], y=df['Speed'],
         fill='tozeroy', mode='lines',
-        line=dict(width=2, color='#00b4d8'),
+        line=dict(width=2, color='#0ea5e9'), # Màu xanh hiện đại
+        fillcolor='rgba(14, 165, 233, 0.1)', # Màu nền mờ
         name='Tốc độ'
     ))
     # Vẽ đường Nhiệt độ (Trục phải)
     fig.add_trace(go.Scatter(
         x=df['time'], y=df['Temp'],
-        mode='lines', line=dict(color='#ff9f1c', dash='dot', width=2),
+        mode='lines', line=dict(color='#f97316', dash='dot', width=2),
         yaxis='y2', name='Nhiệt độ'
     ))
     
     fig.update_layout(
-        title=dict(text="Lịch sử vận hành (Gần nhất)", font=dict(size=14)),
+        title=dict(text="Lịch sử vận hành (Real-time)", font=dict(size=14, color="#555")),
         height=250,
         margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(showgrid=False),
-        yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0'),
-        yaxis2=dict(title="Temp (°C)", overlaying='y', side='right', showgrid=False),
+        xaxis=dict(showgrid=False, tickformat='%H:%M:%S'),
+        yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0', range=[0, 350]),
+        yaxis2=dict(title="Temp (°C)", overlaying='y', side='right', showgrid=False, range=[0, 60]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        plot_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='white',
         hovermode="x unified"
     )
     return fig
@@ -158,7 +161,6 @@ def render_realtime_tab():
     st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')}")
     
     # --- VÒNG LẶP UPDATE (FRAGMENT) ---
-    # Toàn bộ nội dung tab này sẽ refresh nhẹ nhàng, không reload cả trang
     @st.fragment(run_every=REFRESH_RATE)
     def update_loop():
         df_all = get_recent_data(200)
@@ -178,7 +180,7 @@ def render_realtime_tab():
             last = df.iloc[-1]
             current_col = cols_map[dev]
             
-            # --- AI Logic ---
+            # --- AI Logic (Giữ nguyên) ---
             is_danger = False
             score = 0.0
             if model and len(df) >= 30:
@@ -214,24 +216,24 @@ def render_realtime_tab():
                     
                     if st.session_state.status[dev]:
                         h2.markdown(f'<div class="status-err">⚠️ ERROR</div>', unsafe_allow_html=True)
-                        gauge_color = "red"
+                        gauge_color = "#ef4444" # Đỏ
                     else:
-                        h2.markdown(f'<div class="status-ok">✅ RUN</div>', unsafe_allow_html=True)
-                        gauge_color = "#00CC96"
+                        h2.markdown(f'<div class="status-ok">✅ RUNNING</div>', unsafe_allow_html=True)
+                        gauge_color = "#10b981" # Xanh
 
                     st.markdown("---")
 
                     # Hàng 1: Gauge Charts (Đồng hồ)
                     g1, g2 = st.columns(2)
-                    # QUAN TRỌNG: key cố định (f"g_s_{dev}") -> KHÔNG DÙNG time.time()
+                    # Key cố định -> Fix lỗi nhảy trang
                     g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/p)", 300, gauge_color), use_container_width=True, key=f"g_s_{dev}")
-                    g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "orange"), use_container_width=True, key=f"g_t_{dev}")
+                    g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{dev}")
 
                     # Hàng 2: Metrics chi tiết
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Sản lượng", f"{last['Actual']:,}")
                     m2.metric("Thời gian chạy", f"{int(last['RunTime']/60)}m")
-                    m3.metric("AI Score", f"{score:.2f}", delta="Low is Good" if score < 0.5 else "High Risk", delta_color="inverse")
+                    m3.metric("AI Score", f"{score:.2f}", delta="Thấp là Tốt" if score < 0.5 else "Rủi ro cao", delta_color="inverse")
 
                     # Hàng 3: Trend Chart (Area)
                     st.markdown("---")
@@ -248,7 +250,7 @@ def render_realtime_tab():
     update_loop()
 
 # ===============================================================
-# 4. REPORT TAB (CẢI TIẾN)
+# 4. REPORT TAB (CẢI TIẾN HEATMAP & SCATTER)
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất & Phân tích lỗi")
@@ -276,12 +278,12 @@ def render_analytics_tab():
         k1.metric("Tốc độ trung bình", f"{df['Speed'].mean():.1f}")
         k2.metric("Nhiệt độ trung bình", f"{df['Temp'].mean():.1f}")
         k3.metric("Số lần quá tải (>150)", f"{len(df[df['Speed']>150])}")
-        k4.metric("Số bản ghi", f"{len(df)}")
+        k4.metric("Tổng bản ghi", f"{len(df)}")
         
         st.markdown("---")
 
         # 1. Heatmap: Giờ hoạt động cao điểm
-        st.subheader("🔥 Bản đồ nhiệt: Cường độ hoạt động theo giờ")
+        st.subheader("🔥 Heatmap: Cường độ hoạt động theo giờ")
         df['Hour'] = df.index.hour
         df['Date'] = df.index.date
         heatmap_data = df.groupby(['Date', 'Hour'])['Speed'].mean().unstack(fill_value=0)
@@ -296,7 +298,7 @@ def render_analytics_tab():
         st.subheader("🔍 Phân bố điểm bất thường")
         df['Status'] = np.where(df['Speed'] > 150, 'Quá tải (Danger)', 'Bình thường')
         fig_scat = px.scatter(df, x=df.index, y='Speed', color='Status', 
-                              color_discrete_map={'Quá tải (Danger)': 'red', 'Bình thường': 'blue'},
+                              color_discrete_map={'Quá tải (Danger)': '#ef4444', 'Bình thường': '#3b82f6'},
                               opacity=0.6)
         st.plotly_chart(fig_scat, use_container_width=True)
 
@@ -307,7 +309,6 @@ def render_analytics_tab():
 # MAIN APP
 # ===============================================================
 st.title("🏭 STANLEY FACTORY INTELLIGENCE")
-st.markdown("Hệ thống giám sát & Cảnh báo sớm sử dụng AI")
 st.markdown("---")
 
 tab1, tab2 = st.tabs(["🚀 GIÁM SÁT REAL-TIME", "📈 PHÂN TÍCH DỮ LIỆU"])
