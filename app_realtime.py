@@ -9,24 +9,22 @@ import torch.nn as nn
 import joblib
 import os
 import requests
-import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from supabase import create_client
 
 # ===============================================================
-# 1. CẤU HÌNH & KẾT NỐI (LOGIC CŨ - GIỮ NGUYÊN)
+# 1. CẤU HÌNH & KẾT NỐI
 # ===============================================================
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# --- CSS: Làm đẹp & Ẩn nút mặc định của Streamlit ---
+# CSS Tùy chỉnh (Giữ nguyên giao diện đẹp)
 st.markdown("""
 <style>
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
     .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #f5c2c7; display: inline-block; }
+    .css-1r6slb0 { border: 1px solid #e0e0e0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
     div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
     h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #444; }
-    .blink_me { animation: blinker 1.5s linear infinite; color: red; font-weight: bold;}
-    @keyframes blinker { 50% { opacity: 0; } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -34,15 +32,16 @@ MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-REFRESH_RATE = 2 
+REFRESH_RATE = 5 
 
+# Lấy Secrets
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
     TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
 except:
-    st.error("❌ Thiếu Secrets!")
+    st.error("❌ Thiếu cấu hình Secrets! Vui lòng kiểm tra lại.")
     st.stop()
 
 @st.cache_resource
@@ -77,50 +76,29 @@ def send_telegram(msg):
     except: pass
 
 def get_action(speed):
-    if speed < 50: return "Kiểm tra nguồn điện"
-    if speed > 10000: return "Kiểm tra biến tần"
-    return "Bôi trơn trục"
+    if speed < 50: return "Kiểm tra nguồn điện / Băng tải"
+    if speed > 10000: return "Kiểm tra biến tần / Bộ điều khiển"
+    return "Kiểm tra trục động cơ / Bôi trơn"
 
-# --- HÀM BƠM DỮ LIỆU GIẢ (DEMO MODE) ---
-def inject_demo_data():
-    now_iso = datetime.now().isoformat()
-    # Giả lập số liệu ngẫu nhiên
-    for i, dev_id in enumerate(DEVICES):
-        speed = random.randint(100, 150)
-        temp = random.uniform(30, 45)
-        payload = {
-            "time": now_iso, "DevAddr": dev_id, "Channel": f"0{i+1}",
-            "Actual": random.randint(1000000, 2000000), "Status": 1,
-            "RunTime": 50000, "HeldTime": 20000,
-            "Speed": float(speed), "d_RunTime": 20.0, "d_HeldTime": 0.0,
-            "Temp": temp, "Humidity": 70.0
-        }
-        try: supabase.table("sensor_data").insert(payload).execute()
-        except: pass
-    st.toast("🚀 Đã bơm dữ liệu mẫu! Biểu đồ sẽ nhảy ngay lập tức.")
-
-# --- FIX LỖI THỜI GIAN TRONG HÀM LẤY DATA (QUAN TRỌNG) ---
+# --- HÀM LẤY DATA (ĐÃ SỬA LỖI TIMEZONE) ---
 def get_recent_data(limit=100):
     try:
+        # Lấy dữ liệu mới nhất
         response = supabase.table("sensor_data").select("*").order("time", desc=True).limit(limit).execute()
         df = pd.DataFrame(response.data)
         
         if not df.empty:
-            # FIX LỖI: Dùng pd.to_datetime(..., utc=True) và errors='coerce' để xử lý đa định dạng
-            df['time'] = pd.to_datetime(df['time'], utc=True, errors='coerce') 
-            df = df.dropna(subset=['time']) # Loại bỏ dòng lỗi
-            
-            # Chuyển múi giờ về Asia/Bangkok (+07)
+            # FIX LỖI: Luôn ép về UTC trước khi convert sang giờ VN
+            # Điều này giúp xử lý cả dữ liệu cũ (có múi giờ) và mới (không có)
+            df['time'] = pd.to_datetime(df['time'], utc=True)
             df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
             
-            # Giới hạn 12h gần nhất (giúp biểu đồ trôi mượt và không bị méo)
-            cutoff = datetime.now() - timedelta(hours=12)
-            df = df[df['time'] > cutoff]
+            # QUAN TRỌNG: Chỉ lấy dữ liệu trong 24h qua để tránh nối nét vẽ với dữ liệu cũ mèm
+            cutoff_time = datetime.now() - timedelta(hours=24)
+            df = df[df['time'] > cutoff_time]
             
         return df
     except Exception as e: 
-        # Nếu vẫn lỗi, in ra log để debug
-        print(f"Lỗi tải dữ liệu: {e}")
         return pd.DataFrame()
 
 # ===============================================================
@@ -129,114 +107,159 @@ def get_recent_data(limit=100):
 
 def create_gauge(value, title, max_val=300, color="green"):
     fig = go.Figure(go.Indicator(
-        mode = "gauge+number", value = value,
-        title = {'text': title, 'font': {'size': 16, 'color': '#555'}},
+        mode = "gauge+number",
+        value = value,
+        title = {'text': title, 'font': {'size': 18, 'color': '#555'}},
         gauge = {
-            'axis': {'range': [None, max_val]}, 'bar': {'color': color},
-            'bgcolor': "white", 'borderwidth': 1, 'bordercolor': "#ddd",
-            'steps': [{'range': [0, max_val*0.7], 'color': '#f0fff4'}, {'range': [max_val*0.7, max_val], 'color': '#ffebee'}],
-            'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': max_val * 0.9}
+            'axis': {'range': [None, max_val], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'bar': {'color': color},
+            'bgcolor': "white",
+            'borderwidth': 1,
+            'bordercolor': "#ddd",
+            'steps': [
+                {'range': [0, max_val*0.3], 'color': '#f0fff4'},
+                {'range': [max_val*0.3, max_val*0.7], 'color': '#dcfce7'},
+                {'range': [max_val*0.7, max_val], 'color': '#bbf7d0'}],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': max_val * 0.9}
         }
     ))
-    fig.update_layout(height=180, margin=dict(t=30,b=10,l=25,r=25))
+    fig.update_layout(height=200, margin=dict(t=40,b=10,l=25,r=25))
     return fig
 
-# --- BIỂU ĐỒ CHẠY LIÊN TỤC (SLIDING WINDOW) ---
 def create_trend_chart(df, dev_name):
-    now = datetime.now()
-    x_range = [now - timedelta(minutes=15), now] 
+    # Nếu ít dữ liệu quá thì tạo điểm giả để biểu đồ không bị méo
+    if len(df) < 2:
+        fig = go.Figure()
+        fig.update_layout(
+            title=dict(text="Đang chờ thêm dữ liệu...", font=dict(size=14, color="#555")),
+            height=250, xaxis=dict(showgrid=False), yaxis=dict(showgrid=True)
+        )
+        return fig
 
     fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df['time'], y=df['Speed'],
+        fill='tozeroy', mode='lines+markers', # Thêm markers để dễ nhìn điểm
+        line=dict(width=2, color='#0ea5e9'),
+        fillcolor='rgba(14, 165, 233, 0.1)',
+        name='Tốc độ'
+    ))
+    fig.add_trace(go.Scatter(
+        x=df['time'], y=df['Temp'],
+        mode='lines', line=dict(color='#f97316', dash='dot', width=2),
+        yaxis='y2', name='Nhiệt độ'
+    ))
     
-    if not df.empty:
-        fig.add_trace(go.Scatter(
-            x=df['time'], y=df['Speed'], fill='tozeroy', mode='lines+markers',
-            line=dict(width=2, color='#0ea5e9'), fillcolor='rgba(14, 165, 233, 0.1)', name='Tốc độ'
-        ))
-        fig.add_trace(go.Scatter(
-            x=df['time'], y=df['Temp'], mode='lines', line=dict(color='#f97316', dash='dot', width=1),
-            yaxis='y2', name='Nhiệt độ'
-        ))
-
     fig.update_layout(
-        title=dict(text="Diễn biến 15 phút qua", font=dict(size=14, color="#555")),
-        height=250, margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(
-            showgrid=False, tickformat='%H:%M:%S', 
-            range=x_range, # --- Đảm bảo biểu đồ luôn trôi ---
-            fixedrange=True 
-        ),
+        title=dict(text="Lịch sử vận hành (Real-time)", font=dict(size=14, color="#555")),
+        height=250,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(showgrid=False, tickformat='%H:%M:%S'),
         yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0', range=[0, 350]),
-        yaxis2=dict(title="Temp", overlaying='y', side='right', showgrid=False, range=[0, 100]),
-        legend=dict(orientation="h", y=1.1, x=1), plot_bgcolor='white', hovermode="x unified"
+        yaxis2=dict(title="Temp (°C)", overlaying='y', side='right', showgrid=False, range=[0, 60]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor='white',
+        hovermode="x unified"
     )
     return fig
 
 # ===============================================================
-# 3. REAL-TIME TAB
+# 3. REAL-TIME TAB LOGIC
 # ===============================================================
 def render_realtime_tab():
-    with st.sidebar:
-        st.header("🎮 Điều khiển Demo")
-        if st.button("⚡ Bơm dữ liệu ngay (Demo)", type="primary", use_container_width=True):
-            inject_demo_data()
-        st.info("Sử dụng nút này để xem hiệu ứng nhảy số ngay lập tức.")
-
-    c1, c2 = st.columns([3, 1])
-    c1.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')} | Auto-scroll: ON")
-    c2.markdown('<span class="blink_me">● LIVE CONNECTED</span>', unsafe_allow_html=True)
+    st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')} | Auto-refresh: 5s")
     
     @st.fragment(run_every=REFRESH_RATE)
     def update_loop():
+        # Lấy dữ liệu 24h gần nhất
         df_all = get_recent_data(200)
         
         col1, col2 = st.columns(2)
         cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
 
+        # Nếu không có dữ liệu mới, hiển thị thông báo
         if df_all.empty:
             for dev in DEVICES:
-                with cols_map[dev]: st.warning("⏳ Đang chờ Worker bơm dữ liệu mới...")
+                with cols_map[dev]:
+                    st.warning("⏳ Đang chờ Worker bơm dữ liệu mới (5 phút/lần)...")
             return
 
         for dev in DEVICES:
             df = df_all[df_all['DevAddr'] == dev].sort_values('time')
-            if df.empty:
-                with cols_map[dev]: st.info("Chưa có dữ liệu cho máy này trong 12h qua.")
+            if df.empty: 
+                with cols_map[dev]: st.info("Chưa có dữ liệu cho máy này.")
                 continue
             
             last = df.iloc[-1]
             current_col = cols_map[dev]
             
-            # AI Logic (Rút gọn)
-            score = 0.0; is_danger = False
-            
-            if st.session_state.status[dev]: gauge_color = "#ef4444"
-            else: gauge_color = "#10b981"
+            # --- AI Logic ---
+            is_danger = False
+            score = 0.0
+            if model and len(df) >= 30:
+                cols = ['Speed', 'd_RunTime', 'd_HeldTime', 'Temp', 'Humidity']
+                try:
+                    data = scaler.transform(np.log1p(df[cols].tail(30).values))
+                    with torch.no_grad(): pred = model(torch.tensor(data, dtype=torch.float32).unsqueeze(0))
+                    score = np.mean(np.abs(data[-1, :3] - pred.numpy()[0, :3]))
+                    is_danger = score > config['threshold']
+                except: pass
 
-            # RENDER UI
+            # --- Buffer Cảnh báo ---
+            if is_danger: st.session_state.buffer[dev] += 1
+            else: st.session_state.buffer[dev] = 0
+            
+            confirmed = st.session_state.buffer[dev] >= 3
+            curr_stat = st.session_state.status[dev]
+
+            if confirmed and not curr_stat:
+                send_telegram(f"🔥 **ALARM: {dev}**\nSpeed: {last['Speed']:.0f}")
+                st.session_state.status[dev] = True
+                st.session_state.logs[dev].insert(0, {"Time": last['time'].strftime('%H:%M:%S'), "Type": "AI ANOMALY", "Action": get_action(last['Speed'])})
+            elif not is_danger and curr_stat:
+                send_telegram(f"✅ **NORMAL: {dev}**")
+                st.session_state.status[dev] = False
+
+            # --- RENDER GIAO DIỆN ---
             with current_col:
                 with st.container(border=True):
                     h1, h2 = st.columns([3, 1])
                     h1.subheader(f"📡 Device: {dev[-4:]}")
-                    h2.markdown(f'<div class="status-ok">RUNNING</div>', unsafe_allow_html=True)
+                    
+                    if st.session_state.status[dev]:
+                        h2.markdown(f'<div class="status-err">⚠️ ERROR</div>', unsafe_allow_html=True)
+                        gauge_color = "#ef4444"
+                    else:
+                        h2.markdown(f'<div class="status-ok">✅ RUNNING</div>', unsafe_allow_html=True)
+                        gauge_color = "#10b981"
 
                     st.markdown("---")
                     g1, g2 = st.columns(2)
                     g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/p)", 300, gauge_color), use_container_width=True, key=f"g_s_{dev}")
                     g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{dev}")
 
-                    m1, m2 = st.columns(2)
+                    m1, m2, m3 = st.columns(3)
                     m1.metric("Sản lượng", f"{last['Actual']:,}")
                     m2.metric("Thời gian chạy", f"{int(last['RunTime']/60)}m")
+                    m3.metric("AI Score", f"{score:.2f}", delta="Risk Level", delta_color="inverse")
 
                     st.markdown("---")
                     fig_trend = create_trend_chart(df, dev)
                     st.plotly_chart(fig_trend, use_container_width=True, key=f"trend_{dev}")
 
+                    with st.expander("📝 Nhật ký cảnh báo", expanded=False):
+                        if st.session_state.logs[dev]:
+                            st.dataframe(pd.DataFrame(st.session_state.logs[dev]).head(5), hide_index=True, use_container_width=True)
+                        else:
+                            st.info("Hệ thống hoạt động ổn định.")
+
     update_loop()
 
 # ===============================================================
-# 4. REPORT TAB (FIX LỖI THỜI GIAN)
+# 4. REPORT TAB (CẢI TIẾN)
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất")
@@ -256,13 +279,9 @@ def render_analytics_tab():
             st.warning("Chưa có dữ liệu.")
             return
             
-        # FIX LỖI: Dùng pd.to_datetime(..., utc=True) và errors='coerce' để xử lý đa định dạng
-        df['time'] = pd.to_datetime(df['time'], utc=True, errors='coerce')
-        df = df.dropna(subset=['time']) # Loại bỏ dòng lỗi
-        df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
+        df['time'] = pd.to_datetime(df['time'], utc=True).dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
         df.set_index('time', inplace=True)
         
-        # ... (Phần UI và Biểu đồ Analytics giữ nguyên) ...
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Tốc độ TB", f"{df['Speed'].mean():.1f}")
         k2.metric("Nhiệt độ TB", f"{df['Temp'].mean():.1f}")
