@@ -8,17 +8,11 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 
-print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu hàng loạt (Batch)...")
+print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu siêu mượt (Batch 60 điểm)...")
 
-# --- LẤY KEY TỪ MÔI TRƯỜNG ---
+# --- LẤY KEY TỪ MÔI TRƯỜNG --- (Giữ nguyên)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("⚠️ Chạy Local? Đang tìm key trong .env hoặc hardcode...")
-    # Nếu chạy local để test thì bro điền key vào đây, còn trên GitHub thì kệ nó
-    # SUPABASE_URL = "https://..."
-    # SUPABASE_KEY = "..."
 
 if not SUPABASE_URL:
     print("❌ Lỗi: Thiếu Key Supabase!")
@@ -31,7 +25,7 @@ DEVICES = [
     {"id": "AC0BFBCE8797", "ch": "02"}
 ]
 
-# API Thời tiết
+# API Thời tiết (Giữ nguyên)
 def get_weather():
     try:
         cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
@@ -45,20 +39,22 @@ def get_weather():
     except: return 25.0, 70.0
 
 def run_worker_batch():
-    # Cấu hình Batch: Sinh ra 10 điểm dữ liệu (cho 5 phút, mỗi 30s một điểm)
-    POINTS_PER_RUN = 10
-    INTERVAL_SECONDS = 30
+    # --- THAY ĐỔI TẠI ĐÂY ---
+    POINTS_PER_RUN = 60      # Tăng lên 60 điểm/lần
+    INTERVAL_SECONDS = 5     # Giảm xuống 5 giây/điểm
+    # 60 điểm * 5 giây = 300 giây = 5 phút (Hoàn hảo cho Cron Job 5 phút)
+    # -----------------------
     
     base_temp, base_hum = get_weather()
-    all_payloads = [] # Chứa tất cả dữ liệu để bắn 1 lần
+    all_payloads = []
     
-    start_time_base = datetime.now() - timedelta(minutes=5) # Bắt đầu từ 5 phút trước
+    start_time_base = datetime.now() - timedelta(minutes=5)
 
     for dev in DEVICES:
         dev_id = dev['id']
         ch = dev['ch']
         
-        # 1. Lấy trạng thái CŨ NHẤT hiện tại từ Cloud để cộng dồn tiếp
+        # 1. Lấy trạng thái CŨ NHẤT hiện tại từ Cloud để cộng dồn tiếp (Giữ nguyên)
         curr_actual = 1000000
         curr_runtime = 5000000
         curr_heldtime = 2000000
@@ -72,17 +68,18 @@ def run_worker_batch():
                 curr_heldtime = last['HeldTime']
         except: pass
 
-        # 2. Vòng lặp sinh 10 điểm liên tiếp
+        # 2. Vòng lặp sinh 60 điểm liên tiếp
         for i in range(POINTS_PER_RUN):
-            # Tính thời gian cho điểm dữ liệu này (tăng dần 30s)
+            # Tính thời gian cho điểm dữ liệu này (tăng dần 5s)
             point_time = start_time_base + timedelta(seconds=(i + 1) * INTERVAL_SECONDS)
             
-            # Logic sinh số liệu ngẫu nhiên (giữ nguyên logic cũ)
+            # Logic sinh số liệu ngẫu nhiên (Giữ nguyên logic cũ của bạn)
             chance = 0.95 if dev_id == "4417930D77DA" else 0.98
             is_anomaly = random.random() > chance
+            
+            # Logic tạo NHẤP NHÔ (Nếu bạn muốn thêm logic lượn sóng/hỗn loạn đã gửi trước đó, bạn dán vào đây)
             speed = random.randint(150, 250) if is_anomaly else random.randint(0, 5)
             
-            # Biến động nhẹ nhiệt độ cho thật
             temp = base_temp + random.uniform(-0.5, 0.5)
             
             # Cộng dồn
@@ -104,12 +101,11 @@ def run_worker_batch():
             }
             all_payloads.append(record)
 
-    # 3. Gửi tất cả lên mây 1 lần (Bulk Insert)
+    # 3. Gửi tất cả lên mây 1 lần
     if all_payloads:
         try:
-            # Supabase Insert nhận vào một list -> Rất nhanh
             supabase.table("sensor_data").insert(all_payloads).execute()
-            print(f"✅ Đã bơm thành công {len(all_payloads)} dòng dữ liệu (Batch 5 phút).")
+            print(f"✅ Đã bơm thành công {len(all_payloads)} dòng dữ liệu (Siêu Mượt).")
         except Exception as e:
             print(f"❌ Lỗi Upload: {e}")
 
