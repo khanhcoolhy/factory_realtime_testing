@@ -1,0 +1,28 @@
+name: IoT Worker Simulator
+
+on:
+  schedule:
+    - cron: '*/5 * * * *' # Tự chạy mỗi 5 phút
+  workflow_dispatch:      # Cho phép bấm nút chạy tay ngay lập tức
+
+jobs:
+  run-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas supabase openmeteo-requests requests-cache retry-requests
+
+      - name: Run IoT Worker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python iot_worker.py
