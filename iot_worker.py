@@ -8,9 +8,9 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 
-print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu siêu mượt (Batch 60 điểm)...")
+print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu CHĂM CHỈ (High Performance)...")
 
-# --- LẤY KEY TỪ MÔI TRƯỜNG --- (Giữ nguyên)
+# --- LẤY KEY TỪ MÔI TRƯỜNG ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
@@ -25,7 +25,7 @@ DEVICES = [
     {"id": "AC0BFBCE8797", "ch": "02"}
 ]
 
-# API Thời tiết (Giữ nguyên)
+# API Thời tiết
 def get_weather():
     try:
         cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
@@ -39,11 +39,9 @@ def get_weather():
     except: return 25.0, 70.0
 
 def run_worker_batch():
-    # --- THAY ĐỔI TẠI ĐÂY ---
-    POINTS_PER_RUN = 60      # Tăng lên 60 điểm/lần
-    INTERVAL_SECONDS = 5     # Giảm xuống 5 giây/điểm
-    # 60 điểm * 5 giây = 300 giây = 5 phút (Hoàn hảo cho Cron Job 5 phút)
-    # -----------------------
+    # Cấu hình: 60 điểm/5 phút
+    POINTS_PER_RUN = 60
+    INTERVAL_SECONDS = 5
     
     base_temp, base_hum = get_weather()
     all_payloads = []
@@ -54,60 +52,56 @@ def run_worker_batch():
         dev_id = dev['id']
         ch = dev['ch']
         
-        # 1. Lấy trạng thái CŨ NHẤT hiện tại từ Cloud để cộng dồn tiếp (Giữ nguyên)
-        curr_actual = 1000000
-        curr_runtime = 5000000
-        curr_heldtime = 2000000
-        
+        # Lấy trạng thái cũ
+        curr_actual = 1000000; curr_runtime = 5000000; curr_heldtime = 2000000
         try:
             res = supabase.table("sensor_data").select("*").eq("DevAddr", dev_id).order("time", desc=True).limit(1).execute()
             if res.data:
                 last = res.data[0]
-                curr_actual = last['Actual']
-                curr_runtime = last['RunTime']
-                curr_heldtime = last['HeldTime']
+                curr_actual = last['Actual']; curr_runtime = last['RunTime']; curr_heldtime = last['HeldTime']
         except: pass
 
-        # 2. Vòng lặp sinh 60 điểm liên tiếp
         for i in range(POINTS_PER_RUN):
-            # Tính thời gian cho điểm dữ liệu này (tăng dần 5s)
             point_time = start_time_base + timedelta(seconds=(i + 1) * INTERVAL_SECONDS)
             
-            # Logic sinh số liệu ngẫu nhiên (Giữ nguyên logic cũ của bạn)
-            chance = 0.95 if dev_id == "4417930D77DA" else 0.98
-            is_anomaly = random.random() > chance
+            # --- SỬA LOGIC TẠI ĐÂY ---
+            # Máy chạy ổn định 95% thời gian (Speed cao)
+            # Chỉ dừng/lỗi 5% thời gian (Speed thấp)
+            is_running = random.random() < 0.95 
             
-            # Logic tạo NHẤP NHÔ (Nếu bạn muốn thêm logic lượn sóng/hỗn loạn đã gửi trước đó, bạn dán vào đây)
-            speed = random.randint(150, 250) if is_anomaly else random.randint(0, 5)
+            if is_running:
+                # Máy chạy: Tốc độ dao động từ 180 đến 240 (Nhìn cho mạnh)
+                speed = random.randint(180, 240)
+            else:
+                # Máy dừng: Tốc độ về 0 hoặc rất thấp
+                speed = random.randint(0, 5)
             
-            temp = base_temp + random.uniform(-0.5, 0.5)
+            # Nhiệt độ tăng theo tốc độ
+            temp = base_temp + (speed / 300 * 15) + random.uniform(-0.5, 0.5)
             
             # Cộng dồn
-            curr_actual += speed
-            curr_runtime += (20 if speed > 0 else 0)
-            curr_heldtime += (20 if speed == 0 else 0)
-            status = 1 if speed > 0 else 2
+            curr_actual += int(speed / 12) # Giả sử 12 speed = 1 sản phẩm
+            curr_runtime += (INTERVAL_SECONDS if speed > 0 else 0)
+            curr_heldtime += (INTERVAL_SECONDS if speed == 0 else 0)
             
-            # Đóng gói
             record = {
                 "time": point_time.isoformat(),
                 "DevAddr": dev_id, "Channel": ch,
-                "Actual": curr_actual, "Status": status,
+                "Actual": curr_actual, "Status": 1 if speed > 10 else 2,
                 "RunTime": curr_runtime, "HeldTime": curr_heldtime,
                 "Speed": float(speed),
-                "d_RunTime": 20.0 if speed > 0 else 0.0,
-                "d_HeldTime": 20.0 if speed == 0 else 0.0,
+                "d_RunTime": float(INTERVAL_SECONDS) if speed > 0 else 0.0,
+                "d_HeldTime": float(INTERVAL_SECONDS) if speed == 0 else 0.0,
                 "Temp": float(f"{temp:.2f}"), "Humidity": base_hum
             }
             all_payloads.append(record)
 
-    # 3. Gửi tất cả lên mây 1 lần
     if all_payloads:
         try:
             supabase.table("sensor_data").insert(all_payloads).execute()
-            print(f"✅ Đã bơm thành công {len(all_payloads)} dòng dữ liệu (Siêu Mượt).")
+            print(f"✅ Đã bơm {len(all_payloads)} điểm dữ liệu CHĂM CHỈ!")
         except Exception as e:
-            print(f"❌ Lỗi Upload: {e}")
+            print(f"❌ Lỗi: {e}")
 
 if __name__ == "__main__":
     run_worker_batch()
