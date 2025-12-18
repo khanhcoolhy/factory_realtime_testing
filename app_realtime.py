@@ -26,9 +26,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Tên file giống notebook đã lưu
 MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
+
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
 REFRESH_RATE = 2  # Refresh nhanh
 
@@ -36,8 +38,8 @@ REFRESH_RATE = 2  # Refresh nhanh
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
-    TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
+    TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
+    TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
 except:
     st.error("❌ Thiếu cấu hình Secrets!")
     st.stop()
@@ -47,23 +49,47 @@ def init_connection():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase = init_connection()
 
+# --- LOAD AI MODEL & CONFIG ---
 @st.cache_resource
 def load_ai():
-    if not os.path.exists(MODEL_PATH): return None, None, None
+    if not os.path.exists(MODEL_PATH): 
+        st.warning(f"⚠️ Không tìm thấy file model: {MODEL_PATH}")
+        return None, None, None
     try:
-        cfg = joblib.load(CONFIG_PATH); scl = joblib.load(SCALER_PATH)
-        class LSTM(nn.Module):
-            def __init__(self, n, h=128): super().__init__(); self.l = nn.LSTM(n, h, 3, batch_first=True); self.f = nn.Linear(h, n)
-            def forward(self, x): o, _ = self.l(x); return self.f(o[:, -1, :])
-        mdl = LSTM(cfg['n_features'], cfg['hidden_dim'])
-        mdl.load_state_dict(torch.load(MODEL_PATH, map_location='cpu')); mdl.eval()
-        return mdl, scl, cfg
-    except: return None, None, None
+        # Load Config & Scaler
+        cfg = joblib.load(CONFIG_PATH)
+        scl = joblib.load(SCALER_PATH)
+        
+        # Định nghĩa lại class LSTM giống hệt Notebook training
+        class LSTMModel(nn.Module):
+            def __init__(self, n_features, hidden_dim=128, num_layers=3, dropout=0.2):
+                super(LSTMModel, self).__init__()
+                self.lstm = nn.LSTM(n_features, hidden_dim, num_layers, 
+                                  batch_first=True, dropout=dropout)
+                self.fc = nn.Linear(hidden_dim, n_features)
+
+            def forward(self, x):
+                out, _ = self.lstm(x)
+                out = self.fc(out[:, -1, :]) # Lấy output của bước thời gian cuối cùng
+                return out
+
+        # Khởi tạo model với tham số từ config
+        model = LSTMModel(n_features=cfg['n_features'], 
+                          hidden_dim=cfg['hidden_dim'])
+        
+        # Load weights
+        model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
+        model.eval()
+        
+        return model, scl, cfg
+    except Exception as e:
+        st.error(f"Lỗi load AI: {e}")
+        return None, None, None
 
 model, scaler, config = load_ai()
 
 if 'status' not in st.session_state:
-    st.session_state.status = {d: False for d in DEVICES}
+    st.session_state.status = {d: False for d in DEVICES} # False = OK, True = Error
     st.session_state.buffer = {d: 0 for d in DEVICES}
     st.session_state.logs = {d: [] for d in DEVICES}
 
@@ -73,26 +99,65 @@ def send_telegram(msg):
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=2)
     except: pass
 
-def get_action(speed):
-    if speed < 50: return "Kiểm tra nguồn điện"
-    if speed > 10000: return "Kiểm tra biến tần"
-    return "Bôi trơn trục"
-
 def get_recent_data(limit=1000): 
     try:
         response = supabase.table("sensor_data").select("*").order("time", desc=True).limit(limit).execute()
         df = pd.DataFrame(response.data)
         if not df.empty:
-            # --- FIX LỖI TIME DATA ---
-            # Thêm format='mixed' để xử lý cả dữ liệu có mili-giây và không có
+            # Fix lỗi time data type
             df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
-            
             df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
-            # Lấy data 24h
-            cutoff_time = datetime.now() - timedelta(hours=24)
-            df = df[df['time'] > cutoff_time]
+            
+            # Đảm bảo sort tăng dần theo thời gian để đưa vào LSTM
+            df = df.sort_values('time')
         return df
     except: return pd.DataFrame()
+
+# --- AI INFERENCE LOGIC (SỬA LẠI CHUẨN) ---
+def predict_anomaly(df_device, model, scaler, config):
+    """
+    Logic: Lấy 31 điểm cuối cùng.
+    - Dùng 30 điểm (t-30 đến t-1) để dự đoán điểm t.
+    - So sánh điểm t thực tế với t dự đoán.
+    """
+    SEQ_LEN = 30
+    if len(df_device) < SEQ_LEN + 1:
+        return 0.0, False # Chưa đủ dữ liệu để dự báo
+    
+    # 1. Lấy đúng các features model cần
+    features = config['features_list'] # ['Speed', 'd_RunTime', 'd_HeldTime', 'Temp', 'Humidity']
+    
+    # Lấy 31 dòng cuối cùng
+    data_segment = df_device[features].tail(SEQ_LEN + 1).values
+    
+    # 2. LOG1P (Quan trọng: Khớp với training)
+    data_log = np.log1p(data_segment)
+    
+    # 3. SCALE
+    data_scaled = scaler.transform(data_log)
+    
+    # 4. Chuẩn bị Input (30 dòng đầu) và Target (Dòng cuối cùng)
+    X_input = data_scaled[:-1] # 30 dòng
+    Y_actual = data_scaled[-1] # 1 dòng (hiện tại)
+    
+    # Chuyển sang Tensor
+    X_tensor = torch.tensor(X_input, dtype=torch.float32).unsqueeze(0) # (1, 30, n_features)
+    
+    # 5. Predict
+    with torch.no_grad():
+        Y_pred = model(X_tensor).numpy()[0]
+        
+    # 6. Tính Loss (MAE) chỉ trên các cột Target (Speed, RunTime, HeldTime)
+    # config['target_cols_idx'] thường là [0, 1, 2]
+    target_idx = config.get('target_cols_idx', [0, 1, 2])
+    
+    loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
+    
+    # 7. So sánh Threshold
+    threshold = config['threshold']
+    is_anomaly = loss > threshold
+    
+    return loss, is_anomaly
 
 # ===============================================================
 # 2. UI COMPONENTS
@@ -113,20 +178,13 @@ def create_gauge(value, title, max_val=300, color="green"):
     fig.update_layout(height=200, margin=dict(t=40,b=10,l=25,r=25))
     return fig
 
-# --- LOGIC BIỂU ĐỒ V6: AUTO-SCROLL BẰNG CÁCH CẮT DATA ---
 def create_trend_chart(df, dev_name):
     fig = go.Figure()
-    
     if not df.empty:
-        # Xác định điểm mốc thời gian mới nhất
         latest_time = df['time'].max()
-        # Khung nhìn: 30 phút trước điểm mới nhất
         window_start = latest_time - timedelta(minutes=30)
-        
-        # Lọc dữ liệu
         df_view = df[df['time'] >= window_start]
         
-        # Vẽ đường
         fig.add_trace(go.Scatter(
             x=df_view['time'], y=df_view['Speed'],
             fill='tozeroy', mode='lines', 
@@ -144,7 +202,7 @@ def create_trend_chart(df, dev_name):
         title=dict(text="Lịch sử vận hành (30p gần nhất)", font=dict(size=14, color="#555")),
         height=250, margin=dict(l=10, r=10, t=40, b=10),
         xaxis=dict(showgrid=False, tickformat='%H:%M:%S'),
-        yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0', range=[0, 350]),
+        yaxis=dict(title="Speed", showgrid=True, gridcolor='#f0f0f0', range=[0, 5]), # Speed giờ chỉ 0-5
         yaxis2=dict(title="Temp (°C)", overlaying='y', side='right', showgrid=False, range=[0, 60]),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         plot_bgcolor='white', hovermode="x unified"
@@ -160,7 +218,8 @@ def render_realtime_tab():
     
     @st.fragment(run_every=REFRESH_RATE)
     def update_loop():
-        df_all = get_recent_data(1000)
+        # Lấy đủ data để AI chạy (tối thiểu 31 rows)
+        df_all = get_recent_data(300) 
         
         col1, col2 = st.columns(2)
         cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
@@ -171,7 +230,9 @@ def render_realtime_tab():
             return
 
         for dev in DEVICES:
-            df = df_all[df_all['DevAddr'] == dev].sort_values('time')
+            # Lọc data cho từng thiết bị
+            df = df_all[df_all['DevAddr'] == dev].copy()
+            
             if df.empty: 
                 with cols_map[dev]: st.info("Chưa có dữ liệu.")
                 continue
@@ -179,44 +240,68 @@ def render_realtime_tab():
             last = df.iloc[-1]
             current_col = cols_map[dev]
             
-            # AI Logic (Rút gọn)
-            score = 0.0; is_danger = False
-            if st.session_state.status[dev]: gauge_color = "#ef4444"
-            else: gauge_color = "#10b981"
+            # --- AI PREDICTION ---
+            score = 0.0
+            is_danger = False
+            
+            if model and scaler and config:
+                score, is_danger = predict_anomaly(df, model, scaler, config)
+                
+                # Cập nhật trạng thái vào session
+                if is_danger:
+                    st.session_state.buffer[dev] += 1
+                else:
+                    st.session_state.buffer[dev] = 0
+                
+                # Logic Buffer: Phải lỗi 3 lần liên tiếp mới báo động (tránh nhiễu)
+                if st.session_state.buffer[dev] >= 3:
+                    st.session_state.status[dev] = True
+                    # Ghi log nếu vừa chuyển trạng thái
+                    if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['type'] != 'error':
+                         st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': f"Phát hiện bất thường! Score: {score:.2f}"})
+                         send_telegram(f"🚨 CẢNH BÁO: Máy {dev} gặp sự cố! Score: {score:.2f}")
+                else:
+                    st.session_state.status[dev] = False
+
+            # Màu sắc giao diện
+            gauge_color = "#ef4444" if st.session_state.status[dev] else "#10b981"
 
             with current_col:
                 with st.container(border=True):
                     h1, h2 = st.columns([3, 1])
                     h1.subheader(f"📡 Device: {dev[-4:]}")
                     
-                    if st.session_state.status[dev]: h2.markdown(f'<div class="status-err">⚠️ ERROR</div>', unsafe_allow_html=True)
-                    else: h2.markdown(f'<div class="status-ok">✅ RUNNING</div>', unsafe_allow_html=True)
+                    if st.session_state.status[dev]: h2.markdown(f'<div class="status-err">⚠️ ABNORMAL</div>', unsafe_allow_html=True)
+                    else: h2.markdown(f'<div class="status-ok">✅ NORMAL</div>', unsafe_allow_html=True)
 
                     st.markdown("---")
                     g1, g2 = st.columns(2)
-                    g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/p)", 300, gauge_color), use_container_width=True, key=f"g_s_{dev}")
+                    # Speed max bây giờ chỉ tầm 5
+                    g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{dev}")
                     g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{dev}")
 
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Sản lượng", f"{last['Actual']:,}")
                     m2.metric("Thời gian chạy", f"{int(last['RunTime']/60)}m")
-                    m3.metric("AI Score", f"{score:.2f}")
+                    
+                    # Hiển thị AI Score
+                    m3.metric("Anomaly Score", f"{score:.4f}", delta_color="inverse", 
+                              delta="Nguy hiểm" if is_danger else "Ổn định")
 
                     st.markdown("---")
-                    # GỌI BIỂU ĐỒ V6
                     fig_trend = create_trend_chart(df, dev)
                     st.plotly_chart(fig_trend, use_container_width=True, key=f"trend_{dev}")
 
                     with st.expander("📝 Nhật ký cảnh báo", expanded=False):
                         if st.session_state.logs[dev]:
-                            st.dataframe(pd.DataFrame(st.session_state.logs[dev]).head(5), hide_index=True, use_container_width=True)
+                            st.dataframe(pd.DataFrame(st.session_state.logs[dev]).iloc[::-1].head(5), hide_index=True, use_container_width=True)
                         else:
                             st.info("Hệ thống hoạt động ổn định.")
 
     update_loop()
 
 # ===============================================================
-# 4. REPORT TAB (SCATTER PLOT THEO YÊU CẦU)
+# 4. REPORT TAB
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất")
@@ -235,24 +320,21 @@ def render_analytics_tab():
             st.warning("Chưa có dữ liệu.")
             return
         
-        # --- FIX LỖI TIME DATA ---
-        # Thêm format='mixed' để xử lý cả dữ liệu có mili-giây và không có
         df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
-        
         df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
         
-        # KPI
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Tốc độ TB", f"{df['Speed'].mean():.1f}")
+        k1.metric("Tốc độ TB", f"{df['Speed'].mean():.2f}")
         k2.metric("Tốc độ Max", f"{df['Speed'].max():.0f}")
         k3.metric("Nhiệt độ TB", f"{df['Temp'].mean():.1f} °C")
         k4.metric("Tổng bản ghi", f"{len(df)}")
         
         st.markdown("---")
 
-        # 1. DONUT CHART (Trạng thái)
-        conditions = [(df['Speed'] == 0), (df['Speed'] > 0) & (df['Speed'] <= 150), (df['Speed'] > 150)]
-        choices = ['Dừng (Idle)', 'Hoạt động (Running)', 'Quá tải (Overload)']
+        # Speed > 0.5 coi như đang chạy (vì speed là 0,1,2)
+        conditions = [(df['Speed'] == 0), (df['Speed'] > 0)]
+        choices = ['Dừng (Idle)', 'Hoạt động (Running)']
+        # Có thể thêm logic Quá tải nếu Speed > 3 (bất thường)
         df['State'] = np.select(conditions, choices, default='Không rõ')
 
         st.subheader("⏱️ Tỷ lệ Thời gian Vận hành")
@@ -262,19 +344,18 @@ def render_analytics_tab():
         c1, c2 = st.columns(2)
         with c1:
             fig_pie = px.pie(state_counts, values='Count', names='State', hole=0.4, color='State',
-                             color_discrete_map={'Dừng (Idle)': '#9e9e9e', 'Hoạt động (Running)': '#2ecc71', 'Quá tải (Overload)': '#e74c3c'})
+                             color_discrete_map={'Dừng (Idle)': '#9e9e9e', 'Hoạt động (Running)': '#2ecc71'})
             fig_pie.update_layout(height=300, margin=dict(t=0, b=0, l=0, r=0))
             st.plotly_chart(fig_pie, use_container_width=True)
         with c2:
             st.dataframe(state_counts, use_container_width=True, hide_index=True)
 
-        # 2. SCATTER PLOT (PHÂN BỐ TỐC ĐỘ)
-        st.subheader("📊 Phân bố Tốc độ (Scatter Detail)")
+        st.subheader("📊 Phân bố Tốc độ")
         fig_scatter = px.scatter(df, x="time", y="Speed", color="State",
-                                 color_discrete_map={'Dừng (Idle)': 'gray', 'Hoạt động (Running)': 'green', 'Quá tải (Overload)': 'red'},
+                                 color_discrete_map={'Dừng (Idle)': 'gray', 'Hoạt động (Running)': 'green'},
                                  title="Chi tiết các điểm vận hành theo thời gian")
         fig_scatter.update_traces(marker=dict(size=6, opacity=0.7))
-        fig_scatter.update_layout(height=400, xaxis_title="Thời gian", yaxis_title="Tốc độ (sp/p)")
+        fig_scatter.update_layout(height=400, xaxis_title="Thời gian", yaxis_title="Tốc độ (sp/20s)")
         st.plotly_chart(fig_scatter, use_container_width=True)
 
     except Exception as e:
