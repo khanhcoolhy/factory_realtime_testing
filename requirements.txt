@@ -3,6 +3,7 @@ pandas
 plotly
 numpy
 torch
+scikit-learn
 joblib
 supabase
 openmeteo_requests
