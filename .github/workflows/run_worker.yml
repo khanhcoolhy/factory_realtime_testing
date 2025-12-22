@@ -1,12 +1,13 @@
-name: IoT Worker Simulator
+name: IoT Factory Simulation (Worker + Monitor)
 
 on:
   schedule:
-    - cron: '*/20 * * * *'  # <--- SỬA THÀNH 20 (Khớp với 20 phút dữ liệu của worker)
-  workflow_dispatch:
+    # Chạy mỗi 20 phút (phút thứ 0, 20, 40)
+    - cron: '*/20 * * * *'
+  workflow_dispatch: # Cho phép bấm chạy thủ công để test ngay
 
 jobs:
-  run-worker:
+  run-simulation:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -18,12 +19,23 @@ jobs:
           python-version: '3.9'
 
       - name: Install dependencies
-        # Các thư viện này vẫn đúng, không cần sửa
+        # Cài chung tất cả thư viện cho cả 2 file (Worker + Monitor)
+        # Lưu ý: Cài torch sẽ hơi lâu một chút (khoảng 1-2 phút)
         run: |
-          pip install pandas supabase openmeteo-requests requests-cache retry-requests
+          pip install pandas supabase openmeteo-requests requests-cache retry-requests torch numpy joblib scikit-learn requests
 
-      - name: Run IoT Worker
+      - name: 1. Run IoT Worker (Generate Data)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python iot_worker.py
+
+      - name: 2. Run Backend Monitor (Check & Alert)
+        # Bước này chỉ chạy nếu bước 1 thành công
+        if: success() 
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python backend_monitor.py
