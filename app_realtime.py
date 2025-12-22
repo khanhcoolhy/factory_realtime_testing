@@ -17,7 +17,6 @@ from supabase import create_client
 # ===============================================================
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# CSS để giao diện đẹp và không bị giật
 st.markdown("""
 <style>
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
@@ -25,9 +24,6 @@ st.markdown("""
     .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #ffeeba; display: inline-block; }
     div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
     h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #444; }
-    
-    /* Ẩn nút Stop ở góc trên bên phải khi chạy loop */
-    div[data-testid="stStatusWidget"] {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -36,7 +32,7 @@ SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-REFRESH_RATE = 2 # Giảm xuống 2s cho mượt vì dùng st.empty không bị lag
+REFRESH_RATE = 2  # Tự động refresh sau mỗi 2 giây
 TEMP_CRASH_THRESHOLD = 40.0
 
 # Lấy Secrets
@@ -200,102 +196,85 @@ def create_trend_chart(df, dev_name):
     return fig
 
 # ===============================================================
-# REAL-TIME TAB (FIX REFRESH LIÊN TỤC)
+# REAL-TIME TAB (FIX: Dùng st.fragment thay vì while True)
 # ===============================================================
-def render_realtime_tab():
-    # 1. TẠO KHUNG GIAO DIỆN CỐ ĐỊNH (SKELETON)
-    # Chúng ta vẽ khung trước, sau đó dùng st.empty() để tạo các ô trống.
-    # Dữ liệu sẽ được update vào các ô trống này mà không reload lại toàn bộ trang.
+
+# 🚀 ĐÂY LÀ ĐIỂM SỬA CHÍNH: Dùng @st.fragment để auto-refresh riêng vùng này
+@st.fragment(run_every=REFRESH_RATE) 
+def render_realtime_content():
+    # 1. Cập nhật thời gian
+    now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
+    st.caption(f"Last update: {now_str} (Live Mode)")
     
-    last_update_ph = st.empty() # Placeholder cho dòng thời gian
+    # 2. Lấy dữ liệu mới
+    df_all = get_recent_data(300)
     
+    if df_all.empty:
+        st.warning("⏳ Đang chờ Worker bơm dữ liệu...")
+        return
+
+    # 3. Vẽ UI
     col1, col2 = st.columns(2)
-    
-    # Tạo dictionary chứa các placeholder cho từng thiết bị
-    placeholders = {}
-    
-    # Vẽ khung cho từng thiết bị
     cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
+
     for dev in DEVICES:
-        with cols_map[dev]:
-            # Tạo một container trống, ta sẽ ghi đè nội dung vào đây trong vòng lặp
-            placeholders[dev] = st.empty()
-
-    # 2. VÒNG LẶP UPDATE DỮ LIỆU
-    # Sử dụng while True để update liên tục vào các placeholder đã tạo
-    while True:
-        # Cập nhật thời gian
-        now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
-        last_update_ph.caption(f"Last update: {now_str} (Live Mode)")
+        df = df_all[df_all['DevAddr'] == dev].copy()
+        if df.empty: continue
         
-        # Lấy dữ liệu mới
-        df_all = get_recent_data(300)
+        last = df.iloc[-1]
+        current_col = cols_map[dev]
         
-        if df_all.empty:
-            st.toast("Đang chờ dữ liệu...", icon="⏳")
-            time.sleep(5)
-            continue
+        # Logic AI & Status
+        score, is_danger, color_code, status_text, log_msg = determine_status_logic(df, model, scaler, config)
 
-        # Xử lý từng thiết bị
-        for dev in DEVICES:
-            df = df_all[df_all['DevAddr'] == dev].copy()
-            if df.empty: continue
-            
-            last = df.iloc[-1]
-            
-            # Logic AI & Status
-            score, is_danger, color_code, status_text, log_msg = determine_status_logic(df, model, scaler, config)
-
-            # Buffer báo động giả
-            if is_danger: st.session_state.buffer[dev] += 1
-            else: st.session_state.buffer[dev] = 0
-            
-            final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
-
-            # Ghi Log
-            if final_is_anomaly:
-                 if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
-                      st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
-                      if st.session_state.buffer[dev] == 2 or "CRASH" in status_text: 
-                         send_telegram(f"🚨 {dev}: {log_msg}")
-
-            # Màu sắc
-            css_class = "status-ok"
-            if color_code == "red": css_class = "status-err"
-            elif color_code == "orange": css_class = "status-warn"
-            gauge_color = "#ef4444" if color_code == "red" else ("#f59e0b" if color_code == "orange" else "#10b981")
-
-            # --- QUAN TRỌNG: GHI ĐÈ VÀO PLACEHOLDER CỦA THIẾT BỊ ---
-            with placeholders[dev].container():
-                with st.container(border=True):
-                    h1, h2 = st.columns([2, 2])
-                    h1.subheader(f"📡 {dev[-4:]}")
-                    h2.markdown(f'<div class="{css_class}">{status_text}</div>', unsafe_allow_html=True)
-
-                    st.markdown("---")
-                    g1, g2 = st.columns(2)
-                    g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{dev}_{now_str}") # Thêm now_str vào key để tránh duplicate id
-                    g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{dev}_{now_str}")
-
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Sản lượng", f"{last['Actual']:,}")
-                    m2.metric("Runtime", f"{int(last['RunTime']/60)}m")
-                    m3.metric("AI Score", f"{score:.3f}", delta="NGUY HIỂM" if final_is_anomaly else "Ổn định", delta_color="inverse")
-
-                    st.markdown("---")
-                    st.plotly_chart(create_trend_chart(df, dev), use_container_width=True, key=f"trend_{dev}_{now_str}")
-
-                    with st.expander("📝 Nhật ký sự cố", expanded=final_is_anomaly):
-                        if st.session_state.logs[dev]:
-                            st.dataframe(pd.DataFrame(st.session_state.logs[dev]).iloc[::-1].head(5), hide_index=True, use_container_width=True)
-                        else:
-                            st.info("Chưa ghi nhận sự cố nào.")
+        # Buffer báo động giả
+        if is_danger: st.session_state.buffer[dev] += 1
+        else: st.session_state.buffer[dev] = 0
         
-        # Nghỉ trước khi lặp lại (Giúp giao diện không bị quá tải)
-        time.sleep(REFRESH_RATE)
+        final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
+
+        # Ghi Log
+        if final_is_anomaly:
+                if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
+                    st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
+                    if st.session_state.buffer[dev] == 2 or "CRASH" in status_text: 
+                        send_telegram(f"🚨 {dev}: {log_msg}")
+
+        # Màu sắc
+        css_class = "status-ok"
+        if color_code == "red": css_class = "status-err"
+        elif color_code == "orange": css_class = "status-warn"
+        gauge_color = "#ef4444" if color_code == "red" else ("#f59e0b" if color_code == "orange" else "#10b981")
+
+        with current_col:
+            with st.container(border=True):
+                h1, h2 = st.columns([2, 2])
+                h1.subheader(f"📡 {dev[-4:]}")
+                h2.markdown(f'<div class="{css_class}">{status_text}</div>', unsafe_allow_html=True)
+
+                st.markdown("---")
+                g1, g2 = st.columns(2)
+                # Thêm key ngẫu nhiên để force vẽ lại biểu đồ mượt mà
+                chart_key = f"{dev}_{now_str}"
+                g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{chart_key}")
+                g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{chart_key}")
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Sản lượng", f"{last['Actual']:,}")
+                m2.metric("Runtime", f"{int(last['RunTime']/60)}m")
+                m3.metric("AI Score", f"{score:.3f}", delta="NGUY HIỂM" if final_is_anomaly else "Ổn định", delta_color="inverse")
+
+                st.markdown("---")
+                st.plotly_chart(create_trend_chart(df, dev), use_container_width=True, key=f"trend_{chart_key}")
+
+                with st.expander("📝 Nhật ký sự cố", expanded=final_is_anomaly):
+                    if st.session_state.logs[dev]:
+                        st.dataframe(pd.DataFrame(st.session_state.logs[dev]).iloc[::-1].head(5), hide_index=True, use_container_width=True)
+                    else:
+                        st.info("Chưa ghi nhận sự cố nào.")
 
 # ===============================================================
-# ANALYTICS TAB (Giữ nguyên)
+# ANALYTICS TAB
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất")
@@ -352,7 +331,9 @@ st.markdown("---")
 tab1, tab2 = st.tabs(["🚀 REAL-TIME MONITOR", "📈 ANALYTICS"])
 
 with tab1:
-    # Ở Tab Realtime, ta gọi hàm chạy vòng lặp vô tận
-    render_realtime_tab()
+    # Gọi hàm đã được decorate bởi @st.fragment
+    render_realtime_content()
+
 with tab2:
+    # Hàm này giờ sẽ chạy bình thường khi bấm sang tab 2
     render_analytics_tab()
