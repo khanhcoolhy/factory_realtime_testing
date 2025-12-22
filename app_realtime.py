@@ -39,8 +39,7 @@ TEMP_CRASH_THRESHOLD = 40.0
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    TELEGRAM_TOKEN = st.secrets.get("TELEGRAM_TOKEN", "")
-    TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
+    # Đã xóa Telegram Token ở đây vì Frontend không cần gửi tin nhắn nữa
 except:
     st.error("❌ Thiếu cấu hình Secrets!")
     st.stop()
@@ -80,12 +79,6 @@ model, scaler, config = load_ai()
 if 'status' not in st.session_state:
     st.session_state.buffer = {d: 0 for d in DEVICES}
     st.session_state.logs = {d: [] for d in DEVICES}
-
-# --- HELPERS ---
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN: return
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=2)
-    except: pass
 
 def get_recent_data(limit=1000): 
     try:
@@ -196,24 +189,20 @@ def create_trend_chart(df, dev_name):
     return fig
 
 # ===============================================================
-# REAL-TIME TAB (FIX: Dùng st.fragment thay vì while True)
+# REAL-TIME TAB (NO TELEGRAM)
 # ===============================================================
 
-# 🚀 ĐÂY LÀ ĐIỂM SỬA CHÍNH: Dùng @st.fragment để auto-refresh riêng vùng này
 @st.fragment(run_every=REFRESH_RATE) 
 def render_realtime_content():
-    # 1. Cập nhật thời gian
     now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
     st.caption(f"Last update: {now_str} (Live Mode)")
     
-    # 2. Lấy dữ liệu mới
     df_all = get_recent_data(300)
     
     if df_all.empty:
         st.warning("⏳ Đang chờ Worker bơm dữ liệu...")
         return
 
-    # 3. Vẽ UI
     col1, col2 = st.columns(2)
     cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
 
@@ -233,12 +222,11 @@ def render_realtime_content():
         
         final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
 
-        # Ghi Log
+        # Ghi Log vào UI (Nhưng KHÔNG gửi Telegram)
         if final_is_anomaly:
                 if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
                     st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
-                    if st.session_state.buffer[dev] == 2 or "CRASH" in status_text: 
-                        send_telegram(f"🚨 {dev}: {log_msg}")
+                    # ĐÃ XÓA ĐOẠN GỬI TELEGRAM Ở ĐÂY
 
         # Màu sắc
         css_class = "status-ok"
@@ -254,7 +242,6 @@ def render_realtime_content():
 
                 st.markdown("---")
                 g1, g2 = st.columns(2)
-                # Thêm key ngẫu nhiên để force vẽ lại biểu đồ mượt mà
                 chart_key = f"{dev}_{now_str}"
                 g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{chart_key}")
                 g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{chart_key}")
@@ -331,9 +318,7 @@ st.markdown("---")
 tab1, tab2 = st.tabs(["🚀 REAL-TIME MONITOR", "📈 ANALYTICS"])
 
 with tab1:
-    # Gọi hàm đã được decorate bởi @st.fragment
     render_realtime_content()
 
 with tab2:
-    # Hàm này giờ sẽ chạy bình thường khi bấm sang tab 2
     render_analytics_tab()
