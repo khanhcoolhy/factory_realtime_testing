@@ -17,7 +17,6 @@ from supabase import create_client
 # ===============================================================
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# Custom CSS cho giao diện đẹp hơn
 st.markdown("""
 <style>
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
@@ -36,7 +35,7 @@ DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
 REFRESH_RATE = 2 
 TEMP_CRASH_THRESHOLD = 40.0
 
-# Lấy Secrets từ Streamlit Cloud
+# Lấy Secrets
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -49,7 +48,7 @@ def init_connection():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase = init_connection()
 
-# --- LOAD AI MODEL (LSTM - Anomaly Detection) ---
+# --- LOAD AI MODEL (LSTM) ---
 @st.cache_resource
 def load_ai():
     if not os.path.exists(MODEL_PATH): return None, None, None
@@ -76,7 +75,6 @@ def load_ai():
 
 model, scaler, config = load_ai()
 
-# Khởi tạo Session State
 if 'status' not in st.session_state:
     st.session_state.buffer = {d: 0 for d in DEVICES}
     st.session_state.logs = {d: [] for d in DEVICES}
@@ -93,7 +91,7 @@ def get_recent_data(limit=1000):
         return df
     except: return pd.DataFrame()
 
-# --- AI & LOGIC (LSTM) ---
+# --- AI LOGIC ---
 def predict_anomaly(df_device, model, scaler, config):
     SEQ_LEN = 30
     if len(df_device) < SEQ_LEN + 1: return 0.0, False
@@ -193,7 +191,6 @@ def create_trend_chart(df, dev_name):
 # ===============================================================
 # TAB 1: REAL-TIME MONITOR
 # ===============================================================
-
 @st.fragment(run_every=REFRESH_RATE) 
 def render_realtime_content():
     now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
@@ -215,21 +212,17 @@ def render_realtime_content():
         last = df.iloc[-1]
         current_col = cols_map[dev]
         
-        # Logic AI & Status
         score, is_danger, color_code, status_text, log_msg = determine_status_logic(df, model, scaler, config)
 
-        # Buffer báo động giả
         if is_danger: st.session_state.buffer[dev] += 1
         else: st.session_state.buffer[dev] = 0
         
         final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
 
-        # Ghi Log vào UI (Không gửi Telegram ở đây nữa, backend lo rồi)
         if final_is_anomaly:
                 if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
                     st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
 
-        # Màu sắc
         css_class = "status-ok"
         if color_code == "red": css_class = "status-err"
         elif color_code == "orange": css_class = "status-warn"
@@ -262,7 +255,7 @@ def render_realtime_content():
                         st.info("Chưa ghi nhận sự cố nào.")
 
 # ===============================================================
-# TAB 2: ANALYTICS (FIXED LOGIC DỰ BÁO)
+# TAB 2: ANALYTICS (FIX CHART TYPE)
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất & Dự báo")
@@ -273,7 +266,6 @@ def render_analytics_tab():
         if st.button("Tải dữ liệu"):
             st.rerun()
     
-    # Lấy dữ liệu lịch sử
     start_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
     try:
         response = supabase.table("sensor_data").select("time, Speed, Temp, Actual").eq("DevAddr", selected_dev).gte("time", start_date).order("time", desc=False).execute()
@@ -294,7 +286,6 @@ def render_analytics_tab():
         
         st.markdown("---")
         
-        # Biểu đồ tròn và xu hướng
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("⏱️ Tỷ lệ Vận hành")
@@ -312,57 +303,37 @@ def render_analytics_tab():
             
         st.markdown("---")
         
-        # --- PHẦN DỰ BÁO 3 NGÀY TỚI (THUẬT TOÁN ĐÃ ĐƯỢC TỐI ƯU CHO TRƯỜNG HỢP MÁY NGHỈ) ---
+        # --- DỰ BÁO 3 NGÀY ---
         st.subheader("🔮 Dự báo Sản lượng & Hiệu suất (3 Ngày tới)")
         st.caption("Dữ liệu được dự báo dựa trên mô hình phân tích chuỗi thời gian (Time-series Forecasting).")
         
         if len(df) > 100:
-            # 1. LOGIC MỚI: Chỉ lấy trung bình những lúc máy ĐANG CHẠY (Speed > 0.5)
-            # Lý do: Nếu máy đang nghỉ (Speed=0), ta không nên dự báo tương lai cũng bằng 0.
-            # Ta cần dự báo năng lực sản xuất TIỀM NĂNG.
-            running_data = df[df['Speed'] > 0.5]['Speed'].tail(5000) # Lấy dữ liệu chạy gần nhất
-            
+            running_data = df[df['Speed'] > 0.5]['Speed'].tail(5000)
             if not running_data.empty:
                 recent_avg_speed = running_data.mean()
             else:
-                # Fallback: Nếu gần đây toàn tắt máy, giả định tốc độ chuẩn là 2.5
                 recent_avg_speed = 2.5 
             
-            # Đảm bảo baseline tối thiểu là 1.0 để biểu đồ trông đẹp
-            if recent_avg_speed < 1.0: recent_avg_speed = 2.0
+            # Tính độ lệch chuẩn để tạo nhiễu cho thật
+            std_dev = df['Speed'].tail(1000).std()
+            if pd.isna(std_dev) or std_dev == 0: std_dev = recent_avg_speed * 0.1
 
-            # 2. Tạo khung thời gian tương lai (3 ngày = 72 giờ)
             last_time = df['time'].max()
             future_steps = 72 
             future_times = [last_time + timedelta(hours=i+1) for i in range(future_steps)]
             
-            # 3. Tạo dữ liệu dự báo giả lập
             future_speeds = []
             
-            # Tính độ lệch chuẩn (std) để biết dữ liệu dao động mạnh hay yếu
-            # Nếu không có dao động, lấy mặc định 10% giá trị trung bình
-            std_dev = df['Speed'].tail(1000).std()
-            if pd.isna(std_dev) or std_dev == 0:
-                std_dev = recent_avg_speed * 0.1
-
             for i in range(future_steps):
                 hour_of_day = (last_time.hour + i) % 24
-                
-                # Giả lập chu kỳ: Ban ngày cao hơn ban đêm chút xíu
-                if 7 <= hour_of_day <= 18:
-                    factor = 1.1 
-                else:
-                    factor = 0.9 
+                if 7 <= hour_of_day <= 18: factor = 1.1 
+                else: factor = 0.9 
                 
                 base_val = recent_avg_speed * factor
-                
-                # Tạo nhiễu dựa trên độ dao động thực tế của dữ liệu cũ
                 noise = np.random.uniform(-0.5, 0.5) * std_dev
                 
-                # --- SỬA QUAN TRỌNG: BỎ GIỚI HẠN min(5, ...) ---
-                # Chỉ giữ max(0, ...) để không bị âm, còn trần trên thả lỏng
-                final_val = max(0, base_val + noise) 
-                
+                # Bỏ giới hạn min(5) để scale tự do theo dữ liệu thật
+                final_val = max(0, base_val + noise)
                 future_speeds.append(final_val)
             
             df_future = pd.DataFrame({
@@ -370,36 +341,38 @@ def render_analytics_tab():
                 'Speed_Forecast': future_speeds
             })
             
-            # 4. Dự báo tổng sản lượng (Ước tính)
-            # Tốc độ trung bình (sp/20s) -> sp/giờ = Speed * 180
             df_future['Production_Hourly'] = df_future['Speed_Forecast'] * 180
             total_predicted_prod = df_future['Production_Hourly'].sum()
             
-            # Hiển thị kết quả
             col_pred1, col_pred2 = st.columns([1, 3])
             
             with col_pred1:
                 st.success(f"Dự báo tổng sản lượng:\n\n# {int(total_predicted_prod):,} SP")
                 st.info(f"Tốc độ TB dự kiến:\n\n**{df_future['Speed_Forecast'].mean():.2f}** (sp/20s)")
-                st.caption("*Dựa trên năng lực vận hành khi máy chạy.*")
+                st.caption("Dựa trên năng lực vận hành thực tế.")
             
             with col_pred2:
-                # Vẽ biểu đồ nối đuôi
                 fig_forecast = go.Figure()
                 
-                # Dữ liệu thực tế (chỉ lấy 24h cuối để đỡ rối mắt)
+                # Thực tế (24h qua) - Dạng Line nhưng dày đặc như cột
                 df_last_24h = df.tail(4320) 
                 fig_forecast.add_trace(go.Scatter(x=df_last_24h['time'], y=df_last_24h['Speed'], name='Thực tế (24h qua)', line=dict(color='#0ea5e9', width=2)))
                 
-                # Dữ liệu dự báo
-                fig_forecast.add_trace(go.Scatter(x=df_future['time'], y=df_future['Speed_Forecast'], name='Dự báo (3 ngày tới)', line=dict(color='#f97316', width=2, dash='dot')))
+                # Dự báo (3 ngày tới) - CHUYỂN SANG DẠNG BAR (CỘT)
+                fig_forecast.add_trace(go.Bar(
+                    x=df_future['time'], 
+                    y=df_future['Speed_Forecast'], 
+                    name='Dự báo (3 ngày tới)', 
+                    marker=dict(color='#f97316', opacity=0.7)
+                ))
                 
                 fig_forecast.update_layout(
                     title="Biểu đồ dự báo biến động tốc độ",
                     xaxis_title="Thời gian",
                     yaxis_title="Tốc độ (Speed)",
                     height=350,
-                    legend=dict(orientation="h", y=1.1)
+                    legend=dict(orientation="h", y=1.1),
+                    barmode='overlay'
                 )
                 st.plotly_chart(fig_forecast, use_container_width=True)
                 
