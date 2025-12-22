@@ -11,28 +11,28 @@ from datetime import datetime, timedelta
 # ===============================================================
 # 1. CẤU HÌNH & KHỞI TẠO
 # ===============================================================
-print("🕵️ MONITOR: Khởi động hệ thống giám sát Backend...")
+print("🕵️ MONITOR: Khởi động hệ thống giám sát Backend (AI + GSheet)...")
 
-# Các file Model (Phải có sẵn trong repo GitHub)
+# --- FILE MODEL ---
 MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 
-# Danh sách thiết bị cần giám sát
+# --- THIẾT BỊ ---
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-
-# Ngưỡng nhiệt độ để xác định máy chết (Crash) khi Speed = 0
 TEMP_CRASH_THRESHOLD = 40.0 
 
-# Lấy Secrets từ biến môi trường (Github Actions sẽ tự điền vào)
+# --- GOOGLE SHEET URL (Của bạn) ---
+GSHEET_URL = "https://script.google.com/macros/s/AKfycbx-NbALoc4_iisA-rQO5Z1uFzfh1HYo6B2y4e_FlFqyCV0y_bQRiILYa2LjMbQhZ9uI/exec"
+
+# --- SECRETS (GITHUB ACTIONS) ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Kiểm tra biến môi trường
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ Lỗi: Thiếu Key SUPABASE_URL hoặc SUPABASE_KEY!")
+    print("❌ Lỗi: Thiếu Key SUPABASE!")
     exit(1)
 
 # Kết nối Supabase
@@ -49,13 +49,10 @@ def load_ai():
     if not os.path.exists(MODEL_PATH): 
         print(f"❌ Không tìm thấy file model: {MODEL_PATH}")
         return None, None, None
-    
     try:
-        # Load Config & Scaler
         cfg = joblib.load(CONFIG_PATH)
         scl = joblib.load(SCALER_PATH)
         
-        # Định nghĩa lại kiến trúc mạng LSTM (phải khớp lúc train)
         class LSTMModel(nn.Module):
             def __init__(self, n_features, hidden_dim=128, num_layers=3, dropout=0.2):
                 super(LSTMModel, self).__init__()
@@ -66,52 +63,58 @@ def load_ai():
                 out = self.fc(out[:, -1, :])
                 return out
 
-        # Load Weights
         model = LSTMModel(n_features=cfg['n_features'], hidden_dim=cfg['hidden_dim'])
         model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
         model.eval()
-        
         print("✅ Đã load xong Model AI & Scaler.")
         return model, scl, cfg
     except Exception as e:
-        print(f"❌ Lỗi khi load AI Model: {e}")
+        print(f"❌ Lỗi load AI Model: {e}")
         return None, None, None
 
-# Load model ngay khi script chạy
 model, scaler, config = load_ai()
 
 # ===============================================================
-# 3. HÀM GỬI TELEGRAM
+# 3. CÁC HÀM CẢNH BÁO (ALERTS)
 # ===============================================================
+
 def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: 
-        print("⚠️ Không có Token Telegram, bỏ qua gửi tin nhắn.")
-        return
-    
+    """Gửi tin nhắn cảnh báo qua Telegram"""
+    if not TELEGRAM_TOKEN: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": msg, 
-        "parse_mode": "Markdown"
-    }
-    
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
     try:
-        resp = requests.post(url, json=payload, timeout=5)
+        requests.post(url, json=payload, timeout=5)
+        print("📨 Đã gửi cảnh báo Telegram.")
+    except:
+        print("⚠️ Không thể gửi Telegram.")
+
+def save_to_google_sheet(dev_id, error_type, message, score):
+    """Lưu nhật ký sự cố vào Google Sheet qua Apps Script"""
+    try:
+        payload = {
+            "dev_id": dev_id,
+            "type": error_type,
+            "message": message,
+            "score": float(score)
+        }
+        # Gửi POST request tới Google Script
+        resp = requests.post(GSHEET_URL, json=payload, timeout=10)
         if resp.status_code == 200:
-            print("📨 Đã gửi cảnh báo Telegram thành công.")
+            print(f"🗒️ Đã lưu nhật ký vào Google Sheet thành công.")
         else:
-            print(f"⚠️ Gửi Telegram thất bại: {resp.text}")
+            print(f"⚠️ GSheet trả lỗi: {resp.status_code}")
     except Exception as e:
-        print(f"❌ Lỗi kết nối Telegram: {e}")
+        print(f"❌ Lỗi khi ghi Google Sheet: {e}")
 
 # ===============================================================
-# 4. LOGIC KIỂM TRA (CORE)
+# 4. LOGIC KIỂM TRA CHÍNH
 # ===============================================================
 def check_device_status(dev_id):
     print(f"\n🔍 Đang kiểm tra thiết bị: {dev_id}...")
     
-    # 1. Lấy dữ liệu từ Supabase (Lấy dư 40 dòng để chắc ăn)
     try:
+        # 1. Lấy dữ liệu mới nhất từ Supabase
         response = supabase.table("sensor_data")\
             .select("*")\
             .eq("DevAddr", dev_id)\
@@ -120,114 +123,81 @@ def check_device_status(dev_id):
             .execute()
             
         df = pd.DataFrame(response.data)
+        if df.empty: return
         
-        if df.empty: 
-            print("   -> ⚠️ Không có dữ liệu trong DB.")
-            return
-        
-        # Sắp xếp lại theo thời gian tăng dần (Cũ -> Mới) để đưa vào LSTM
         df['time'] = pd.to_datetime(df['time'])
         df = df.sort_values('time')
-        
-        # Lấy dòng mới nhất để kiểm tra trạng thái hiện tại
         last_row = df.iloc[-1]
         
-        # 2. Kiểm tra tính mới của dữ liệu (Staleness Check)
-        # Nếu dữ liệu cũ quá 25 phút -> Worker có thể đã chết -> Không báo lỗi máy hỏng
+        # 2. Check dữ liệu quá cũ (trên 25 phút)
         now_utc = datetime.utcnow()
-        last_time_utc = last_row['time'].replace(tzinfo=None)
-        time_diff = (now_utc - last_time_utc).total_seconds()
-        
-        if time_diff > 1500: # 1500s = 25 phút
-            print(f"   -> 💤 Dữ liệu quá cũ ({int(time_diff/60)} phút trước). Bỏ qua.")
+        time_diff = (now_utc - last_row['time'].replace(tzinfo=None)).total_seconds()
+        if time_diff > 1500:
+            print(f"   -> 💤 Dữ liệu quá cũ, bỏ qua.")
             return
 
-        # 3. LOGIC PHÁT HIỆN SỰ CỐ (CRASH) - Rule Based
-        # Speed = 0 nhưng Nhiệt độ cao -> Máy dừng đột ngột
+        # 3. KIỂM TRA CRASH (Rule-based)
         if last_row['Speed'] == 0:
             if last_row['Temp'] > TEMP_CRASH_THRESHOLD:
-                msg = (
+                # PHÁT HIỆN LỖI
+                msg_content = f"Dừng đột ngột! Temp: {last_row['Temp']}°C"
+                full_msg = (
                     f"🚨 **CẢNH BÁO SỰ CỐ (CRASH)**\n"
-                    f"---------------\n"
                     f"🤖 Thiết bị: `{dev_id}`\n"
-                    f"🌡️ Nhiệt độ: **{last_row['Temp']}°C** (Quá nóng!)\n"
-                    f"🛑 Tốc độ: 0\n"
-                    f"🕒 Lúc: {last_row['time'].strftime('%H:%M:%S')}\n"
-                    f"---------------\n"
-                    f"⚠️ *Máy dừng đột ngột, vui lòng kiểm tra ngay!*"
+                    f"⚠️ Lỗi: {msg_content}\n"
+                    f"🕒 Lúc: {last_row['time'].strftime('%H:%M:%S')}"
                 )
                 print("   -> 🔴 PHÁT HIỆN CRASH!")
-                send_telegram(msg)
+                send_telegram(full_msg)
+                # Ghi vào Google Sheet
+                save_to_google_sheet(dev_id, "CRASH", msg_content, 0.0)
             else:
-                print("   -> 💤 Máy đang nghỉ (Idle) - Nhiệt độ thấp.")
-            return # Nếu Speed = 0 thì không chạy AI nữa
+                print("   -> 💤 Máy nghỉ (Idle).")
+            return
 
-        # 4. LOGIC AI (Anomaly Detection) - Khi Speed > 0
+        # 4. KIỂM TRA AI (Anomaly Detection)
         SEQ_LEN = 30
-        
-        # Kiểm tra đủ dữ liệu để chạy AI không
-        if len(df) < SEQ_LEN + 1:
-            print(f"   -> ⚠️ Không đủ dữ liệu liên tục (Cần {SEQ_LEN+1}, có {len(df)}).")
-            return
-            
-        if model is None:
-            print("   -> ⚠️ Model chưa load được, bỏ qua bước AI.")
-            return
+        if len(df) < SEQ_LEN + 1 or model is None: return
 
-        # Chuẩn bị dữ liệu cho Model
         features = config['features_list']
-        try:
-            # Lấy đúng đoạn dữ liệu cuối cùng
-            data_segment = df[features].tail(SEQ_LEN + 1).values
-        except KeyError as e:
-             print(f"   -> ❌ Thiếu cột dữ liệu: {e}")
-             return
-
-        # Transform (Log -> Scale)
+        data_segment = df[features].tail(SEQ_LEN + 1).values
         data_log = np.log1p(data_segment)
         data_scaled = scaler.transform(data_log)
         
         X_input = torch.tensor(data_scaled[:-1], dtype=torch.float32).unsqueeze(0)
         Y_actual = data_scaled[-1]
         
-        # Dự báo
         with torch.no_grad():
             Y_pred = model(X_input).numpy()[0]
         
-        # Tính sai số (Loss)
         target_idx = config.get('target_cols_idx', [0, 1, 2])
         loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
         
-        # So sánh với ngưỡng
         if loss > config['threshold']:
-            # Phân loại lỗi sơ bộ
-            if last_row['Speed'] < 1.5:
-                err_type = "🐢 Kẹt tải / Tốc độ chậm"
-            else:
-                err_type = "⚠️ Quá tải / Rung lắc"
-                
-            msg = (
+            # PHÁT HIỆN LỖI
+            err_type = "Kẹt tải/Chậm" if last_row['Speed'] < 1.5 else "Quá tải/Rung lắc"
+            msg_content = f"AI phát hiện bất thường: {err_type}"
+            full_msg = (
                 f"⚠️ **PHÁT HIỆN BẤT THƯỜNG (AI)**\n"
-                f"---------------\n"
                 f"🤖 Thiết bị: `{dev_id}`\n"
-                f"📉 AI Score: **{loss:.3f}** (Ngưỡng: {config['threshold']:.2f})\n"
-                f"🔧 Loại lỗi: {err_type}\n"
-                f"🏎️ Tốc độ: {last_row['Speed']}\n"
-                f"🕒 Lúc: {last_row['time'].strftime('%H:%M:%S')}\n"
+                f"📉 AI Score: {loss:.3f}\n"
+                f"🔧 Loại: {err_type}\n"
+                f"🕒 Lúc: {last_row['time'].strftime('%H:%M:%S')}"
             )
-            print(f"   -> 🟠 PHÁT HIỆN BẤT THƯỜNG AI (Loss: {loss:.3f})")
-            send_telegram(msg)
+            print(f"   -> 🟠 BẤT THƯỜNG AI (Loss: {loss:.3f})")
+            send_telegram(full_msg)
+            # Ghi vào Google Sheet
+            save_to_google_sheet(dev_id, "AI_ANOMALY", msg_content, loss)
         else:
-            print(f"   -> ✅ Hoạt động bình thường (Loss: {loss:.3f})")
+            print(f"   -> ✅ Bình thường (Loss: {loss:.3f})")
 
     except Exception as e:
-        print(f"❌ Lỗi không mong muốn với {dev_id}: {e}")
+        print(f"❌ Lỗi: {e}")
 
 # ===============================================================
-# 5. MAIN LOOP
+# 5. MAIN
 # ===============================================================
 if __name__ == "__main__":
     for dev in DEVICES:
         check_device_status(dev)
-    
-    print("\n🏁 Kết thúc phiên giám sát.")
+    print("\n🏁 Hoàn tất phiên giám sát.")
