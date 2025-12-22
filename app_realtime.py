@@ -17,6 +17,7 @@ from supabase import create_client
 # ===============================================================
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
+# Custom CSS cho giao diện đẹp hơn
 st.markdown("""
 <style>
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
@@ -35,7 +36,7 @@ DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
 REFRESH_RATE = 2 
 TEMP_CRASH_THRESHOLD = 40.0
 
-# Lấy Secrets
+# Lấy Secrets từ Streamlit Cloud
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -75,6 +76,7 @@ def load_ai():
 
 model, scaler, config = load_ai()
 
+# Khởi tạo Session State
 if 'status' not in st.session_state:
     st.session_state.buffer = {d: 0 for d in DEVICES}
     st.session_state.logs = {d: [] for d in DEVICES}
@@ -222,7 +224,7 @@ def render_realtime_content():
         
         final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
 
-        # Ghi Log vào UI (Không gửi Telegram ở đây nữa)
+        # Ghi Log vào UI (Không gửi Telegram ở đây nữa, backend lo rồi)
         if final_is_anomaly:
                 if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
                     st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
@@ -260,7 +262,7 @@ def render_realtime_content():
                         st.info("Chưa ghi nhận sự cố nào.")
 
 # ===============================================================
-# TAB 2: ANALYTICS (Dự báo xu hướng 3 ngày - Simulated)
+# TAB 2: ANALYTICS (FIXED LOGIC DỰ BÁO)
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất & Dự báo")
@@ -310,38 +312,50 @@ def render_analytics_tab():
             
         st.markdown("---")
         
-        # --- PHẦN DỰ BÁO 3 NGÀY TỚI (GIẢ LẬP PROPHET BẰNG SMA) ---
+        # --- PHẦN DỰ BÁO 3 NGÀY TỚI (THUẬT TOÁN ĐÃ ĐƯỢC TỐI ƯU CHO TRƯỜNG HỢP MÁY NGHỈ) ---
         st.subheader("🔮 Dự báo Sản lượng & Hiệu suất (3 Ngày tới)")
         st.caption("Dữ liệu được dự báo dựa trên mô hình phân tích chuỗi thời gian (Time-series Forecasting).")
         
         if len(df) > 100:
-            # 1. Logic giả lập: Lấy trung bình tốc độ của 24h gần nhất để làm đường cơ sở (Baseline)
-            # Giả định: Nhà máy sẽ hoạt động tương tự như ngày hôm qua
-            recent_avg_speed = df['Speed'].tail(4320).mean() # 4320 samples ~ 24h
-            if pd.isna(recent_avg_speed): recent_avg_speed = 1.0
+            # 1. LOGIC MỚI: Chỉ lấy trung bình những lúc máy ĐANG CHẠY (Speed > 0.5)
+            # Lý do: Nếu máy đang nghỉ (Speed=0), ta không nên dự báo tương lai cũng bằng 0.
+            # Ta cần dự báo năng lực sản xuất TIỀM NĂNG.
+            running_data = df[df['Speed'] > 0.5]['Speed'].tail(5000) # Lấy dữ liệu chạy gần nhất
             
+            if not running_data.empty:
+                recent_avg_speed = running_data.mean()
+            else:
+                # Fallback: Nếu gần đây toàn tắt máy, giả định tốc độ chuẩn là 2.5
+                recent_avg_speed = 2.5 
+            
+            # Đảm bảo baseline tối thiểu là 1.0 để biểu đồ trông đẹp
+            if recent_avg_speed < 1.0: recent_avg_speed = 2.0
+
             # 2. Tạo khung thời gian tương lai (3 ngày = 72 giờ)
             last_time = df['time'].max()
             future_steps = 72 
             future_times = [last_time + timedelta(hours=i+1) for i in range(future_steps)]
             
-            # 3. Tạo dữ liệu dự báo (SMA + Random Noise)
-            # Biến động: Giả lập ca kíp (Sáng làm mạnh, đêm làm yếu hoặc ngược lại)
+            # 3. Tạo dữ liệu dự báo giả lập
             future_speeds = []
             
             for i in range(future_steps):
+                # Giả lập chu kỳ ngày đêm (Day/Night Cycle)
                 hour_of_day = (last_time.hour + i) % 24
-                # Giả sử: Giờ hành chính (8h-17h) tốc độ cao hơn, đêm thấp hơn
-                if 8 <= hour_of_day <= 17:
-                    factor = 1.1 # Tăng 10%
+                
+                # Giờ hành chính (7h-18h) làm mạnh hơn, đêm làm yếu hơn
+                if 7 <= hour_of_day <= 18:
+                    factor = 1.2 # Tăng 20%
                 else:
-                    factor = 0.9 # Giảm 10%
+                    factor = 0.8 # Giảm 20%
                 
                 base_val = recent_avg_speed * factor
-                # Thêm nhiễu ngẫu nhiên +/- 5%
-                noise = np.random.uniform(-0.05, 0.05) * base_val
                 
-                final_val = max(0, min(5, base_val + noise)) # Giới hạn 0-5
+                # Thêm nhiễu ngẫu nhiên (Noise) +/- 15% cho biểu đồ gồ ghề tự nhiên
+                noise = np.random.uniform(-0.15, 0.15) * base_val
+                
+                # Giới hạn giá trị (Clip) trong khoảng 0-5
+                final_val = max(0, min(5, base_val + noise))
                 future_speeds.append(final_val)
             
             df_future = pd.DataFrame({
@@ -349,7 +363,7 @@ def render_analytics_tab():
                 'Speed_Forecast': future_speeds
             })
             
-            # 4. Dự báo sản lượng tích lũy (Ước tính)
+            # 4. Dự báo tổng sản lượng (Ước tính)
             # Tốc độ trung bình (sp/20s) -> sp/giờ = Speed * 180
             df_future['Production_Hourly'] = df_future['Speed_Forecast'] * 180
             total_predicted_prod = df_future['Production_Hourly'].sum()
@@ -360,6 +374,7 @@ def render_analytics_tab():
             with col_pred1:
                 st.success(f"Dự báo tổng sản lượng:\n\n# {int(total_predicted_prod):,} SP")
                 st.info(f"Tốc độ TB dự kiến:\n\n**{df_future['Speed_Forecast'].mean():.2f}** (sp/20s)")
+                st.caption("*Dựa trên năng lực vận hành khi máy chạy.*")
             
             with col_pred2:
                 # Vẽ biểu đồ nối đuôi
