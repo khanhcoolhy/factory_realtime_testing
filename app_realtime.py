@@ -17,6 +17,7 @@ from supabase import create_client
 # ===============================================================
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
+# CSS để giao diện đẹp và không bị giật
 st.markdown("""
 <style>
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
@@ -24,6 +25,9 @@ st.markdown("""
     .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #ffeeba; display: inline-block; }
     div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
     h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #444; }
+    
+    /* Ẩn nút Stop ở góc trên bên phải khi chạy loop */
+    div[data-testid="stStatusWidget"] {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -32,8 +36,8 @@ SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-REFRESH_RATE = 5 
-TEMP_CRASH_THRESHOLD = 40.0  # Ngưỡng nhiệt độ để xác định Crash khi Speed=0
+REFRESH_RATE = 2 # Giảm xuống 2s cho mượt vì dùng st.empty không bị lag
+TEMP_CRASH_THRESHOLD = 40.0
 
 # Lấy Secrets
 try:
@@ -50,7 +54,7 @@ def init_connection():
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 supabase = init_connection()
 
-# --- LOAD AI MODEL & CONFIG ---
+# --- LOAD AI MODEL ---
 @st.cache_resource
 def load_ai():
     if not os.path.exists(MODEL_PATH): return None, None, None
@@ -78,7 +82,6 @@ def load_ai():
 model, scaler, config = load_ai()
 
 if 'status' not in st.session_state:
-    st.session_state.status = {d: "OK" for d in DEVICES}
     st.session_state.buffer = {d: 0 for d in DEVICES}
     st.session_state.logs = {d: [] for d in DEVICES}
 
@@ -99,17 +102,16 @@ def get_recent_data(limit=1000):
         return df
     except: return pd.DataFrame()
 
-# --- AI PREDICTION CORE ---
+# --- AI & LOGIC ---
 def predict_anomaly(df_device, model, scaler, config):
     SEQ_LEN = 30
     if len(df_device) < SEQ_LEN + 1: return 0.0, False
     
     features = config['features_list']
-    # Lấy đúng số lượng feature cần thiết
     try:
         data_segment = df_device[features].tail(SEQ_LEN + 1).values
     except KeyError:
-        return 0.0, False # Thiếu cột
+        return 0.0, False
         
     data_log = np.log1p(data_segment)
     data_scaled = scaler.transform(data_log)
@@ -129,20 +131,13 @@ def predict_anomaly(df_device, model, scaler, config):
     is_anomaly = loss > threshold
     return loss, is_anomaly
 
-# --- LOGIC PHÂN LOẠI TRẠNG THÁI (Đã Cải Tiến) ---
 def determine_status_logic(df_device, model, scaler, config):
-    """
-    Hàm này quyết định logic: Khi nào dùng AI, khi nào dùng Rule-based, khi nào báo lỗi dữ liệu.
-    Trả về: (loss_score, is_danger, color_code, status_text, log_msg)
-    """
     if df_device.empty or len(df_device) < 2:
         return 0.0, False, "gray", "NO DATA", "Chưa có dữ liệu"
 
     last_row = df_device.iloc[-1]
     prev_row = df_device.iloc[-2]
     
-    # 1. KIỂM TRA TÍNH LIÊN TỤC
-    # Nếu dữ liệu bị ngắt quá 60s -> Không thể dự báo AI chính xác
     time_diff = (last_row['time'] - prev_row['time']).total_seconds()
     if time_diff > 60:
         return 0.0, False, "orange", "⚠️ SYNC LAG", f"Mất dữ liệu {int(time_diff)}s. Chờ đồng bộ..."
@@ -150,34 +145,25 @@ def determine_status_logic(df_device, model, scaler, config):
     speed = last_row['Speed']
     temp = last_row['Temp']
 
-    # 2. XỬ LÝ KHI MÁY DỪNG (Rule-based, không dùng AI)
     if speed == 0:
         if temp > TEMP_CRASH_THRESHOLD:
-            # Máy dừng nhưng vẫn nóng -> CRASH
             return 9.99, True, "red", "⛔ CRASH", f"Dừng đột ngột! Temp cao: {temp}°C"
         else:
-            # Máy dừng và mát -> IDLE
             return 0.0, False, "gray", "💤 IDLE", "Máy dừng nghỉ theo kế hoạch"
 
-    # 3. XỬ LÝ KHI MÁY CHẠY (Dùng AI Model)
     if model and scaler:
         loss, is_anomaly = predict_anomaly(df_device, model, scaler, config)
-        
         if is_anomaly:
-            # AI phát hiện bất thường
             if speed < 1.5:
                  return loss, True, "orange", "🐢 JAM/SLOW", f"Kẹt/Tải thấp (AI Loss: {loss:.2f})"
             else:
                  return loss, True, "red", "⚠️ OVERLOAD", f"Quá tải/Rung lắc (AI Loss: {loss:.2f})"
         else:
-            # AI thấy bình thường
             return loss, False, "green", "✅ RUNNING", "Hoạt động ổn định"
             
     return 0.0, False, "gray", "LOADING AI", "Đang tải mô hình..."
 
-# ===============================================================
-# UI COMPONENTS
-# ===============================================================
+# --- UI COMPONENTS ---
 def create_gauge(value, title, max_val=5, color="green"):
     fig = go.Figure(go.Indicator(
         mode = "gauge+number", value = value,
@@ -214,56 +200,73 @@ def create_trend_chart(df, dev_name):
     return fig
 
 # ===============================================================
-# REAL-TIME TAB
+# REAL-TIME TAB (FIX REFRESH LIÊN TỤC)
 # ===============================================================
 def render_realtime_tab():
-    now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
-    st.caption(f"Last update: {now_str}")
+    # 1. TẠO KHUNG GIAO DIỆN CỐ ĐỊNH (SKELETON)
+    # Chúng ta vẽ khung trước, sau đó dùng st.empty() để tạo các ô trống.
+    # Dữ liệu sẽ được update vào các ô trống này mà không reload lại toàn bộ trang.
     
-    @st.fragment(run_every=REFRESH_RATE)
-    def update_loop():
-        df_all = get_recent_data(300) 
-        col1, col2 = st.columns(2)
-        cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
+    last_update_ph = st.empty() # Placeholder cho dòng thời gian
+    
+    col1, col2 = st.columns(2)
+    
+    # Tạo dictionary chứa các placeholder cho từng thiết bị
+    placeholders = {}
+    
+    # Vẽ khung cho từng thiết bị
+    cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
+    for dev in DEVICES:
+        with cols_map[dev]:
+            # Tạo một container trống, ta sẽ ghi đè nội dung vào đây trong vòng lặp
+            placeholders[dev] = st.empty()
 
+    # 2. VÒNG LẶP UPDATE DỮ LIỆU
+    # Sử dụng while True để update liên tục vào các placeholder đã tạo
+    while True:
+        # Cập nhật thời gian
+        now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
+        last_update_ph.caption(f"Last update: {now_str} (Live Mode)")
+        
+        # Lấy dữ liệu mới
+        df_all = get_recent_data(300)
+        
         if df_all.empty:
-            st.warning("⏳ Đang chờ Worker bơm dữ liệu...")
-            return
+            st.toast("Đang chờ dữ liệu...", icon="⏳")
+            time.sleep(5)
+            continue
 
+        # Xử lý từng thiết bị
         for dev in DEVICES:
             df = df_all[df_all['DevAddr'] == dev].copy()
             if df.empty: continue
             
             last = df.iloc[-1]
-            current_col = cols_map[dev]
             
-            # --- LOGIC XỬ LÝ MỚI ---
+            # Logic AI & Status
             score, is_danger, color_code, status_text, log_msg = determine_status_logic(df, model, scaler, config)
 
-            # Logic Buffer (Chống báo giả)
+            # Buffer báo động giả
             if is_danger: st.session_state.buffer[dev] += 1
             else: st.session_state.buffer[dev] = 0
             
-            # Chỉ báo lỗi nếu lỗi 2 lần liên tiếp (hoặc Crash thì báo ngay)
             final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
 
             # Ghi Log
             if final_is_anomaly:
-                 # Nếu log cuối cùng chưa phải là lỗi này thì mới ghi
                  if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
                       st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
-                      # Gửi tele nếu mới bắt đầu lỗi
                       if st.session_state.buffer[dev] == 2 or "CRASH" in status_text: 
                          send_telegram(f"🚨 {dev}: {log_msg}")
 
-            # Mapping màu CSS
+            # Màu sắc
             css_class = "status-ok"
             if color_code == "red": css_class = "status-err"
             elif color_code == "orange": css_class = "status-warn"
-            
             gauge_color = "#ef4444" if color_code == "red" else ("#f59e0b" if color_code == "orange" else "#10b981")
 
-            with current_col:
+            # --- QUAN TRỌNG: GHI ĐÈ VÀO PLACEHOLDER CỦA THIẾT BỊ ---
+            with placeholders[dev].container():
                 with st.container(border=True):
                     h1, h2 = st.columns([2, 2])
                     h1.subheader(f"📡 {dev[-4:]}")
@@ -271,8 +274,8 @@ def render_realtime_tab():
 
                     st.markdown("---")
                     g1, g2 = st.columns(2)
-                    g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{dev}")
-                    g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{dev}")
+                    g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{dev}_{now_str}") # Thêm now_str vào key để tránh duplicate id
+                    g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{dev}_{now_str}")
 
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Sản lượng", f"{last['Actual']:,}")
@@ -280,18 +283,19 @@ def render_realtime_tab():
                     m3.metric("AI Score", f"{score:.3f}", delta="NGUY HIỂM" if final_is_anomaly else "Ổn định", delta_color="inverse")
 
                     st.markdown("---")
-                    st.plotly_chart(create_trend_chart(df, dev), use_container_width=True, key=f"trend_{dev}")
+                    st.plotly_chart(create_trend_chart(df, dev), use_container_width=True, key=f"trend_{dev}_{now_str}")
 
                     with st.expander("📝 Nhật ký sự cố", expanded=final_is_anomaly):
                         if st.session_state.logs[dev]:
                             st.dataframe(pd.DataFrame(st.session_state.logs[dev]).iloc[::-1].head(5), hide_index=True, use_container_width=True)
                         else:
                             st.info("Chưa ghi nhận sự cố nào.")
-
-    update_loop()
+        
+        # Nghỉ trước khi lặp lại (Giúp giao diện không bị quá tải)
+        time.sleep(REFRESH_RATE)
 
 # ===============================================================
-# ANALYTICS TAB (Giữ nguyên logic cũ)
+# ANALYTICS TAB (Giữ nguyên)
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất")
@@ -299,6 +303,8 @@ def render_analytics_tab():
     with col1:
         days_back = st.slider("Thời gian (Ngày):", 1, 30, 7)
         selected_dev = st.selectbox("Chọn thiết bị:", DEVICES)
+        if st.button("Tải dữ liệu"):
+            st.rerun()
     
     start_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
     try:
@@ -346,6 +352,7 @@ st.markdown("---")
 tab1, tab2 = st.tabs(["🚀 REAL-TIME MONITOR", "📈 ANALYTICS"])
 
 with tab1:
+    # Ở Tab Realtime, ta gọi hàm chạy vòng lặp vô tận
     render_realtime_tab()
 with tab2:
     render_analytics_tab()
