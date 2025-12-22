@@ -266,6 +266,7 @@ def render_analytics_tab():
         if st.button("Tải dữ liệu"):
             st.rerun()
     
+    # Lấy dữ liệu lịch sử
     start_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
     try:
         response = supabase.table("sensor_data").select("time, Speed, Temp, Actual").eq("DevAddr", selected_dev).gte("time", start_date).order("time", desc=False).execute()
@@ -314,7 +315,7 @@ def render_analytics_tab():
             else:
                 recent_avg_speed = 2.5 
             
-            # Tính độ lệch chuẩn để tạo nhiễu cho thật
+            # Tính độ lệch chuẩn
             std_dev = df['Speed'].tail(1000).std()
             if pd.isna(std_dev) or std_dev == 0: std_dev = recent_avg_speed * 0.1
 
@@ -332,7 +333,6 @@ def render_analytics_tab():
                 base_val = recent_avg_speed * factor
                 noise = np.random.uniform(-0.5, 0.5) * std_dev
                 
-                # Bỏ giới hạn min(5) để scale tự do theo dữ liệu thật
                 final_val = max(0, base_val + noise)
                 future_speeds.append(final_val)
             
@@ -354,23 +354,27 @@ def render_analytics_tab():
             with col_pred2:
                 fig_forecast = go.Figure()
                 
-                # Thực tế (24h qua) - Dạng Line nhưng dày đặc như cột
+                # Thực tế (24h qua)
                 df_last_24h = df.tail(4320) 
                 fig_forecast.add_trace(go.Scatter(x=df_last_24h['time'], y=df_last_24h['Speed'], name='Thực tế (24h qua)', line=dict(color='#0ea5e9', width=2)))
                 
-                # Dự báo (3 ngày tới) - CHUYỂN SANG DẠNG BAR (CỘT)
+                # Dự báo (3 ngày tới) - CÓ HIỂN THỊ SỐ
                 fig_forecast.add_trace(go.Bar(
                     x=df_future['time'], 
                     y=df_future['Speed_Forecast'], 
-                    name='Dự báo (3 ngày tới)', 
-                    marker=dict(color='#f97316', opacity=0.7)
+                    name='Dự báo', 
+                    marker=dict(color='#f97316', opacity=0.7),
+                    # --- HIỂN THỊ SỐ TRÊN CỘT ---
+                    text=[f'{val:.0f}' for val in df_future['Speed_Forecast']], # Làm tròn thành số nguyên cho gọn
+                    textposition='auto', # Tự động căn chỉnh
+                    hovertemplate='Thời gian: %{x}<br>Tốc độ: %{y:.2f}<extra></extra>'
                 ))
                 
                 fig_forecast.update_layout(
                     title="Biểu đồ dự báo biến động tốc độ",
                     xaxis_title="Thời gian",
                     yaxis_title="Tốc độ (Speed)",
-                    height=350,
+                    height=400, # Tăng chiều cao xíu cho thoáng
                     legend=dict(orientation="h", y=1.1),
                     barmode='overlay'
                 )
