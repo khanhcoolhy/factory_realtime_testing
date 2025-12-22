@@ -339,23 +339,30 @@ def render_analytics_tab():
             # 3. Tạo dữ liệu dự báo giả lập
             future_speeds = []
             
+            # Tính độ lệch chuẩn (std) để biết dữ liệu dao động mạnh hay yếu
+            # Nếu không có dao động, lấy mặc định 10% giá trị trung bình
+            std_dev = df['Speed'].tail(1000).std()
+            if pd.isna(std_dev) or std_dev == 0:
+                std_dev = recent_avg_speed * 0.1
+
             for i in range(future_steps):
-                # Giả lập chu kỳ ngày đêm (Day/Night Cycle)
                 hour_of_day = (last_time.hour + i) % 24
                 
-                # Giờ hành chính (7h-18h) làm mạnh hơn, đêm làm yếu hơn
+                # Giả lập chu kỳ: Ban ngày cao hơn ban đêm chút xíu
                 if 7 <= hour_of_day <= 18:
-                    factor = 1.2 # Tăng 20%
+                    factor = 1.1 
                 else:
-                    factor = 0.8 # Giảm 20%
+                    factor = 0.9 
                 
                 base_val = recent_avg_speed * factor
                 
-                # Thêm nhiễu ngẫu nhiên (Noise) +/- 15% cho biểu đồ gồ ghề tự nhiên
-                noise = np.random.uniform(-0.15, 0.15) * base_val
+                # Tạo nhiễu dựa trên độ dao động thực tế của dữ liệu cũ
+                noise = np.random.uniform(-0.5, 0.5) * std_dev
                 
-                # Giới hạn giá trị (Clip) trong khoảng 0-5
-                final_val = max(0, min(5, base_val + noise))
+                # --- SỬA QUAN TRỌNG: BỎ GIỚI HẠN min(5, ...) ---
+                # Chỉ giữ max(0, ...) để không bị âm, còn trần trên thả lỏng
+                final_val = max(0, base_val + noise) 
+                
                 future_speeds.append(final_val)
             
             df_future = pd.DataFrame({
