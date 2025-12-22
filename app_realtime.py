@@ -32,9 +32,8 @@ SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 
 DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-
-# --- FIX 1: Tăng Refresh Rate lên 5s để tránh loop ---
 REFRESH_RATE = 5 
+TEMP_CRASH_THRESHOLD = 40.0  # Ngưỡng nhiệt độ để xác định Crash khi Speed=0
 
 # Lấy Secrets
 try:
@@ -79,7 +78,7 @@ def load_ai():
 model, scaler, config = load_ai()
 
 if 'status' not in st.session_state:
-    st.session_state.status = {d: "OK" for d in DEVICES} # Lưu trạng thái cụ thể text
+    st.session_state.status = {d: "OK" for d in DEVICES}
     st.session_state.buffer = {d: 0 for d in DEVICES}
     st.session_state.logs = {d: [] for d in DEVICES}
 
@@ -100,13 +99,18 @@ def get_recent_data(limit=1000):
         return df
     except: return pd.DataFrame()
 
-# --- AI PREDICTION & LOGIC PHÂN LOẠI LỖI ---
+# --- AI PREDICTION CORE ---
 def predict_anomaly(df_device, model, scaler, config):
     SEQ_LEN = 30
     if len(df_device) < SEQ_LEN + 1: return 0.0, False
     
     features = config['features_list']
-    data_segment = df_device[features].tail(SEQ_LEN + 1).values
+    # Lấy đúng số lượng feature cần thiết
+    try:
+        data_segment = df_device[features].tail(SEQ_LEN + 1).values
+    except KeyError:
+        return 0.0, False # Thiếu cột
+        
     data_log = np.log1p(data_segment)
     data_scaled = scaler.transform(data_log)
     
@@ -125,22 +129,51 @@ def predict_anomaly(df_device, model, scaler, config):
     is_anomaly = loss > threshold
     return loss, is_anomaly
 
-# --- FIX 2: HÀM PHÂN LOẠI LỖI TRỰC QUAN ---
-def classify_status(speed, is_anomaly, score):
+# --- LOGIC PHÂN LOẠI TRẠNG THÁI (Đã Cải Tiến) ---
+def determine_status_logic(df_device, model, scaler, config):
     """
-    Trả về Tuple: (Mã màu, Text hiển thị, Text Log)
+    Hàm này quyết định logic: Khi nào dùng AI, khi nào dùng Rule-based, khi nào báo lỗi dữ liệu.
+    Trả về: (loss_score, is_danger, color_code, status_text, log_msg)
     """
-    if not is_anomaly:
-        if speed == 0: return ("gray", "💤 IDLE (Dừng nghỉ)", "Máy dừng theo kế hoạch")
-        return ("green", "✅ RUNNING", "Hoạt động bình thường")
+    if df_device.empty or len(df_device) < 2:
+        return 0.0, False, "gray", "NO DATA", "Chưa có dữ liệu"
+
+    last_row = df_device.iloc[-1]
+    prev_row = df_device.iloc[-2]
     
-    # Nếu là ANOMALY (Bất thường)
+    # 1. KIỂM TRA TÍNH LIÊN TỤC
+    # Nếu dữ liệu bị ngắt quá 60s -> Không thể dự báo AI chính xác
+    time_diff = (last_row['time'] - prev_row['time']).total_seconds()
+    if time_diff > 60:
+        return 0.0, False, "orange", "⚠️ SYNC LAG", f"Mất dữ liệu {int(time_diff)}s. Chờ đồng bộ..."
+
+    speed = last_row['Speed']
+    temp = last_row['Temp']
+
+    # 2. XỬ LÝ KHI MÁY DỪNG (Rule-based, không dùng AI)
     if speed == 0:
-        return ("red", "⛔ CRASH (Dừng đột ngột)", f"Sự cố dừng máy! Score: {score:.2f}")
-    elif speed < 1.5: # Speed thấp (0.x hoặc 1)
-        return ("orange", "🐢 JAM/SLOW (Kẹt/Chậm)", f"Cảnh báo kẹt máy/tải thấp. Score: {score:.2f}")
-    else:
-        return ("red", "⚠️ OVERLOAD (Quá tải)", f"Hoạt động bất thường/Sensor lỗi. Score: {score:.2f}")
+        if temp > TEMP_CRASH_THRESHOLD:
+            # Máy dừng nhưng vẫn nóng -> CRASH
+            return 9.99, True, "red", "⛔ CRASH", f"Dừng đột ngột! Temp cao: {temp}°C"
+        else:
+            # Máy dừng và mát -> IDLE
+            return 0.0, False, "gray", "💤 IDLE", "Máy dừng nghỉ theo kế hoạch"
+
+    # 3. XỬ LÝ KHI MÁY CHẠY (Dùng AI Model)
+    if model and scaler:
+        loss, is_anomaly = predict_anomaly(df_device, model, scaler, config)
+        
+        if is_anomaly:
+            # AI phát hiện bất thường
+            if speed < 1.5:
+                 return loss, True, "orange", "🐢 JAM/SLOW", f"Kẹt/Tải thấp (AI Loss: {loss:.2f})"
+            else:
+                 return loss, True, "red", "⚠️ OVERLOAD", f"Quá tải/Rung lắc (AI Loss: {loss:.2f})"
+        else:
+            # AI thấy bình thường
+            return loss, False, "green", "✅ RUNNING", "Hoạt động ổn định"
+            
+    return 0.0, False, "gray", "LOADING AI", "Đang tải mô hình..."
 
 # ===============================================================
 # UI COMPONENTS
@@ -204,39 +237,30 @@ def render_realtime_tab():
             last = df.iloc[-1]
             current_col = cols_map[dev]
             
-            # --- LOGIC XỬ LÝ TRẠNG THÁI ---
-            score = 0.0
-            is_danger = False
-            
-            if model and scaler and config:
-                score, is_danger = predict_anomaly(df, model, scaler, config)
-                
-                # Logic Buffer (Chống báo giả)
-                if is_danger: st.session_state.buffer[dev] += 1
-                else: st.session_state.buffer[dev] = 0
-                
-                # Chỉ báo lỗi nếu lỗi 2 lần liên tiếp
-                final_is_anomaly = st.session_state.buffer[dev] >= 2
-            else:
-                final_is_anomaly = False
+            # --- LOGIC XỬ LÝ MỚI ---
+            score, is_danger, color_code, status_text, log_msg = determine_status_logic(df, model, scaler, config)
 
-            # Phân loại lỗi cụ thể
-            color_code, status_text, log_msg = classify_status(last['Speed'], final_is_anomaly, score)
+            # Logic Buffer (Chống báo giả)
+            if is_danger: st.session_state.buffer[dev] += 1
+            else: st.session_state.buffer[dev] = 0
+            
+            # Chỉ báo lỗi nếu lỗi 2 lần liên tiếp (hoặc Crash thì báo ngay)
+            final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
 
             # Ghi Log
             if final_is_anomaly:
-                 # Nếu log cuối cùng chưa phải là lỗi này thì mới ghi (tránh spam log)
+                 # Nếu log cuối cùng chưa phải là lỗi này thì mới ghi
                  if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
-                     st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
-                     if st.session_state.buffer[dev] == 2: # Chỉ gửi tele khi mới bắt đầu lỗi
-                        send_telegram(f"🚨 {dev}: {log_msg}")
+                      st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
+                      # Gửi tele nếu mới bắt đầu lỗi
+                      if st.session_state.buffer[dev] == 2 or "CRASH" in status_text: 
+                         send_telegram(f"🚨 {dev}: {log_msg}")
 
             # Mapping màu CSS
             css_class = "status-ok"
             if color_code == "red": css_class = "status-err"
             elif color_code == "orange": css_class = "status-warn"
-            elif color_code == "gray": css_class = "status-ok" # Idle vẫn là safe
-
+            
             gauge_color = "#ef4444" if color_code == "red" else ("#f59e0b" if color_code == "orange" else "#10b981")
 
             with current_col:

@@ -8,7 +8,7 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 
-print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu CHUẨN (Matched with Training Data)...")
+print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu CHUẨN + SỰ CỐ (Simulation)...")
 
 # --- LẤY KEY TỪ MÔI TRƯỜNG ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -39,24 +39,20 @@ def get_weather():
     except: return 25.0, 70.0
 
 def run_worker_batch():
-    # --- CẤU HÌNH QUAN TRỌNG ĐỂ KHỚP MODEL ---
-    # Model được train với dữ liệu ~20s/mẫu, nên worker phải sinh ra tương tự
+    # --- CẤU HÌNH ---
     INTERVAL_SECONDS = 20  
-    
-    # Sinh dữ liệu cho 20 phút (60 điểm * 20s = 1200s = 20 phút)
-    POINTS_PER_RUN = 60    
+    POINTS_PER_RUN = 60    # Sinh 20 phút dữ liệu mỗi lần chạy
     
     base_temp, base_hum = get_weather()
     all_payloads = []
     
-    # Lùi thời gian lại để bơm dữ liệu quá khứ gần
     start_time_base = datetime.now() - timedelta(seconds=POINTS_PER_RUN * INTERVAL_SECONDS)
 
     for dev in DEVICES:
         dev_id = dev['id']
         ch = dev['ch']
         
-        # 1. Lấy trạng thái cũ từ DB để cộng dồn tiếp
+        # 1. Lấy trạng thái cũ
         curr_actual = 1000000; curr_runtime = 5000000; curr_heldtime = 2000000
         try:
             res = supabase.table("sensor_data").select("*").eq("DevAddr", dev_id).order("time", desc=True).limit(1).execute()
@@ -71,35 +67,41 @@ def run_worker_batch():
         for i in range(POINTS_PER_RUN):
             point_time = start_time_base + timedelta(seconds=(i + 1) * INTERVAL_SECONDS)
             
-            # --- LOGIC MÔ PHỎNG CHUẨN ---
+            # --- LOGIC MÔ PHỎNG 3 TRẠNG THÁI ---
+            rand_val = random.random()
             
-            # Xác định trạng thái máy: 95% là chạy (Status 1), 5% là dừng (Status 2)
-            is_running = random.random() < 0.95 
+            # Kịch bản phân phối:
+            # 70% Chạy bình thường
+            # 25% Nghỉ (Idle)
+            # 5%  Sự cố (Crash) -> Để test App
             
-            if is_running:
-                status = 1
-                # Khi chạy: Speed là số sản phẩm làm được trong 20s.
-                # Thường là 1 sp, thỉnh thoảng 0 (chưa xong), hiếm khi 2 (làm nhanh)
-                speed = random.choices([0, 1, 2], weights=[0.2, 0.75, 0.05])[0]
-                
-                # Delta thời gian
-                d_runtime = float(INTERVAL_SECONDS)
-                d_heldtime = 0.0
-                
-                # Nhiệt độ máy khi chạy sẽ nóng hơn môi trường khoảng 5-8 độ
-                temp = base_temp + random.uniform(5.0, 8.0)
-                
-            else:
-                status = 2
-                # Khi dừng: Speed chắc chắn là 0
+            if rand_val < 0.05: 
+                # === TRƯỜNG HỢP 1: CRASH (SỰ CỐ) ===
+                # Logic: Speed = 0 NHƯNG Nhiệt độ RẤT CAO
+                status = 2 # Error
                 speed = 0
-                
-                # Delta thời gian
+                d_runtime = 0.0
+                d_heldtime = float(INTERVAL_SECONDS) # Tính vào thời gian dừng
+                # Nhiệt độ cao hơn môi trường rất nhiều (> 40 độ để trigger App)
+                temp = base_temp + random.uniform(20.0, 30.0) 
+
+            elif rand_val < 0.30:
+                # === TRƯỜNG HỢP 2: IDLE (NGHỈ) ===
+                status = 1 # Hoặc trạng thái chờ
+                speed = 0
                 d_runtime = 0.0
                 d_heldtime = float(INTERVAL_SECONDS)
-                
-                # Nhiệt độ máy khi dừng sẽ nguội dần (gần bằng môi trường)
+                # Nhiệt độ mát (nguội dần về nhiệt độ môi trường)
                 temp = base_temp + random.uniform(0.5, 2.0)
+                
+            else:
+                # === TRƯỜNG HỢP 3: RUNNING (CHẠY) ===
+                status = 1
+                speed = random.choices([0, 1, 2], weights=[0.2, 0.75, 0.05])[0]
+                d_runtime = float(INTERVAL_SECONDS)
+                d_heldtime = 0.0
+                # Nhiệt độ ấm (do máy chạy)
+                temp = base_temp + random.uniform(5.0, 10.0)
             
             # Cập nhật cộng dồn
             curr_actual += speed
@@ -114,9 +116,9 @@ def run_worker_batch():
                 "Status": status,
                 "RunTime": float(curr_runtime), 
                 "HeldTime": float(curr_heldtime),
-                "Speed": float(speed),          # Quan trọng: Speed giờ là 0, 1 hoặc 2
-                "d_RunTime": d_runtime,         # Quan trọng: 20.0 hoặc 0.0
-                "d_HeldTime": d_heldtime,       # Quan trọng: 0.0 hoặc 20.0
+                "Speed": float(speed),
+                "d_RunTime": d_runtime,
+                "d_HeldTime": d_heldtime,
                 "Temp": float(f"{temp:.2f}"), 
                 "Humidity": base_hum
             }
@@ -125,11 +127,15 @@ def run_worker_batch():
     # 3. Gửi lên Supabase
     if all_payloads:
         try:
-            # Gửi từng batch nhỏ để tránh quá tải nếu cần, ở đây gửi hết
             supabase.table("sensor_data").insert(all_payloads).execute()
-            print(f"✅ Đã bơm {len(all_payloads)} điểm dữ liệu CHUẨN (Speed 0-2, Interval 20s)!")
+            print(f"✅ Đã bơm {len(all_payloads)} điểm dữ liệu (bao gồm cả CRASH test)!")
         except Exception as e:
             print(f"❌ Lỗi: {e}")
 
 if __name__ == "__main__":
-    run_worker_batch()
+    # Chạy vòng lặp để bơm liên tục mỗi 20s (giả lập realtime)
+    # Hoặc chạy 1 lần rồi thôi tùy bạn. Ở đây mình để loop để bạn test App cho sướng.
+    while True:
+        run_worker_batch()
+        print("😴 Nghỉ 20s trước khi bơm tiếp batch mới (để App kịp hiển thị)...")
+        time.sleep(20)
