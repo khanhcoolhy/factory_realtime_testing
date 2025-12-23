@@ -34,8 +34,8 @@ CONFIG_PATH = "model_config_v2.pkl"
 
 # --- [FIX UI 1] CẤU HÌNH DISPLAY CHO TỪNG MÁY & LÀN ---
 DEVICES_CONFIG = [
-    {"id": "4417930D77DA", "name": "MÁY HÀN 01", "channels": ["01", "02"]},
-    {"id": "AC0BFBCE8797", "name": "MÁY DẬP 02", "channels": ["01", "02"]}
+    {"id": "4417930D77DA", "name": "MÁY MMM 01", "channels": ["01", "02"]},
+    {"id": "AC0BFBCE8797", "name": "MÁY MMM 02", "channels": ["01", "02"]}
 ]
 
 REFRESH_RATE = 2 
