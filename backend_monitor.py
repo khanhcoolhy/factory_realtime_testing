@@ -11,20 +11,24 @@ from datetime import datetime, timedelta
 # ===============================================================
 # 1. CẤU HÌNH & KHỞI TẠO
 # ===============================================================
-print("🕵️ MONITOR: Khởi động hệ thống giám sát Backend...")
+print("🕵️ MONITOR: Khởi động hệ thống giám sát Backend (Multi-Channel Support)...")
 
 # Các file Model (Phải có sẵn trong repo GitHub)
 MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 
-# Danh sách thiết bị cần giám sát
-DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
+# --- [FIX LOGIC 1]: Cấu hình thiết bị kèm theo danh sách Channel (Làn) ---
+# Logic Notebook: Mỗi máy có 2 làn độc lập -> Phải xử lý riêng từng làn.
+DEVICES_CONFIG = [
+    {"id": "4417930D77DA", "channels": ["01", "02"]},
+    {"id": "AC0BFBCE8797", "channels": ["01", "02"]}
+]
 
 # Ngưỡng nhiệt độ để xác định máy chết (Crash) khi Speed = 0
 TEMP_CRASH_THRESHOLD = 40.0 
 
-# Lấy Secrets từ biến môi trường (Github Actions sẽ tự điền vào)
+# Lấy Secrets từ biến môi trường
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -105,16 +109,19 @@ def send_telegram(msg):
         print(f"❌ Lỗi kết nối Telegram: {e}")
 
 # ===============================================================
-# 4. LOGIC KIỂM TRA (CORE)
+# 4. LOGIC KIỂM TRA (CORE) - ĐÃ SỬA LOGIC LANE
 # ===============================================================
-def check_device_status(dev_id):
-    print(f"\n🔍 Đang kiểm tra thiết bị: {dev_id}...")
+def check_lane_status(dev_id, channel_id):
+    # --- [FIX LOGIC 2]: Hàm này chỉ check cụ thể 1 Làn của 1 Máy ---
+    print(f"\n🔍 Đang kiểm tra: {dev_id} - Làn {channel_id}...")
     
-    # 1. Lấy dữ liệu từ Supabase (Lấy dư 40 dòng để chắc ăn)
+    # 1. Lấy dữ liệu từ Supabase
     try:
+        # --- [FIX LOGIC 3]: Thêm .eq("Channel", channel_id) để lọc đúng làn ---
         response = supabase.table("sensor_data")\
             .select("*")\
             .eq("DevAddr", dev_id)\
+            .eq("Channel", channel_id)\
             .order("time", desc=True)\
             .limit(40)\
             .execute()
@@ -122,10 +129,10 @@ def check_device_status(dev_id):
         df = pd.DataFrame(response.data)
         
         if df.empty: 
-            print("   -> ⚠️ Không có dữ liệu trong DB.")
+            print("   -> ⚠️ Không có dữ liệu trong DB cho làn này.")
             return
         
-        # Sắp xếp lại theo thời gian tăng dần (Cũ -> Mới) để đưa vào LSTM
+        # Sắp xếp lại theo thời gian tăng dần (Cũ -> Mới)
         df['time'] = pd.to_datetime(df['time'])
         df = df.sort_values('time')
         
@@ -133,7 +140,6 @@ def check_device_status(dev_id):
         last_row = df.iloc[-1]
         
         # 2. Kiểm tra tính mới của dữ liệu (Staleness Check)
-        # Nếu dữ liệu cũ quá 25 phút -> Worker có thể đã chết -> Không báo lỗi máy hỏng
         now_utc = datetime.utcnow()
         last_time_utc = last_row['time'].replace(tzinfo=None)
         time_diff = (now_utc - last_time_utc).total_seconds()
@@ -143,13 +149,14 @@ def check_device_status(dev_id):
             return
 
         # 3. LOGIC PHÁT HIỆN SỰ CỐ (CRASH) - Rule Based
-        # Speed = 0 nhưng Nhiệt độ cao -> Máy dừng đột ngột
         if last_row['Speed'] == 0:
             if last_row['Temp'] > TEMP_CRASH_THRESHOLD:
+                # --- [FIX LOGIC 4]: Báo rõ Làn nào bị lỗi ---
                 msg = (
                     f"🚨 **CẢNH BÁO SỰ CỐ (CRASH)**\n"
                     f"---------------\n"
                     f"🤖 Thiết bị: `{dev_id}`\n"
+                    f"🛤️ Làn (Channel): `{channel_id}`\n"
                     f"🌡️ Nhiệt độ: **{last_row['Temp']}°C** (Quá nóng!)\n"
                     f"🛑 Tốc độ: 0\n"
                     f"🕒 Lúc: {last_row['time'].strftime('%H:%M:%S')}\n"
@@ -200,7 +207,6 @@ def check_device_status(dev_id):
         
         # So sánh với ngưỡng
         if loss > config['threshold']:
-            # Phân loại lỗi sơ bộ
             if last_row['Speed'] < 1.5:
                 err_type = "🐢 Kẹt tải / Tốc độ chậm"
             else:
@@ -210,6 +216,7 @@ def check_device_status(dev_id):
                 f"⚠️ **PHÁT HIỆN BẤT THƯỜNG (AI)**\n"
                 f"---------------\n"
                 f"🤖 Thiết bị: `{dev_id}`\n"
+                f"🛤️ Làn (Channel): `{channel_id}`\n"
                 f"📉 AI Score: **{loss:.3f}** (Ngưỡng: {config['threshold']:.2f})\n"
                 f"🔧 Loại lỗi: {err_type}\n"
                 f"🏎️ Tốc độ: {last_row['Speed']}\n"
@@ -221,13 +228,18 @@ def check_device_status(dev_id):
             print(f"   -> ✅ Hoạt động bình thường (Loss: {loss:.3f})")
 
     except Exception as e:
-        print(f"❌ Lỗi không mong muốn với {dev_id}: {e}")
+        print(f"❌ Lỗi không mong muốn với {dev_id}-{channel_id}: {e}")
 
 # ===============================================================
 # 5. MAIN LOOP
 # ===============================================================
 if __name__ == "__main__":
-    for dev in DEVICES:
-        check_device_status(dev)
+    # --- [FIX LOGIC 5]: Lặp lồng nhau Device -> Channel ---
+    for device_conf in DEVICES_CONFIG:
+        d_id = device_conf["id"]
+        channels = device_conf["channels"]
+        
+        for ch in channels:
+            check_lane_status(d_id, ch)
     
     print("\n🏁 Kết thúc phiên giám sát.")

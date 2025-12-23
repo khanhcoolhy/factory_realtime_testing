@@ -23,7 +23,8 @@ st.markdown("""
     .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #f5c2c7; display: inline-block; }
     .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #ffeeba; display: inline-block; }
     div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
-    h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #444; }
+    h3 { font-size: 1.1rem !important; font-weight: 700 !important; color: #444; }
+    .block-container { padding-top: 2rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -31,7 +32,12 @@ MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 
-DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
+# --- [FIX UI 1] CẤU HÌNH DISPLAY CHO TỪNG MÁY & LÀN ---
+DEVICES_CONFIG = [
+    {"id": "4417930D77DA", "name": "MÁY HÀN 01", "channels": ["01", "02"]},
+    {"id": "AC0BFBCE8797", "name": "MÁY DẬP 02", "channels": ["01", "02"]}
+]
+
 REFRESH_RATE = 2 
 TEMP_CRASH_THRESHOLD = 40.0
 
@@ -75,9 +81,10 @@ def load_ai():
 
 model, scaler, config = load_ai()
 
+# --- [FIX STATE] State Management cho từng Làn ---
 if 'status' not in st.session_state:
-    st.session_state.buffer = {d: 0 for d in DEVICES}
-    st.session_state.logs = {d: [] for d in DEVICES}
+    st.session_state.buffer = {} # Key sẽ là "DevID_Channel"
+    st.session_state.logs = {}   # Key sẽ là "DevID_Channel"
 
 # --- HÀM HỖ TRỢ ---
 def get_recent_data(limit=1000): 
@@ -128,25 +135,26 @@ def determine_status_logic(df_device, model, scaler, config):
     prev_row = df_device.iloc[-2]
     
     time_diff = (last_row['time'] - prev_row['time']).total_seconds()
-    if time_diff > 60:
-        return 0.0, False, "orange", "⚠️ SYNC LAG", f"Mất dữ liệu {int(time_diff)}s. Chờ đồng bộ..."
+    # Tăng time check lên chút vì dữ liệu gửi mỗi 20s
+    if time_diff > 120:
+        return 0.0, False, "orange", "⚠️ SYNC LAG", f"Mất kết nối {int(time_diff)}s"
 
     speed = last_row['Speed']
     temp = last_row['Temp']
 
     if speed == 0:
         if temp > TEMP_CRASH_THRESHOLD:
-            return 9.99, True, "red", "⛔ CRASH", f"Dừng đột ngột! Temp cao: {temp}°C"
+            return 9.99, True, "red", "⛔ CRASH", f"Dừng đột ngột! Temp: {temp}°C"
         else:
-            return 0.0, False, "gray", "💤 IDLE", "Máy dừng nghỉ theo kế hoạch"
+            return 0.0, False, "gray", "💤 IDLE", "Máy đang nghỉ"
 
     if model and scaler:
         loss, is_anomaly = predict_anomaly(df_device, model, scaler, config)
         if is_anomaly:
             if speed < 1.5:
-                 return loss, True, "orange", "🐢 JAM/SLOW", f"Kẹt/Tải thấp (AI Loss: {loss:.2f})"
+                 return loss, True, "orange", "🐢 SLOW/JAM", f"Tải thấp/Kẹt (Loss: {loss:.2f})"
             else:
-                 return loss, True, "red", "⚠️ OVERLOAD", f"Quá tải/Rung lắc (AI Loss: {loss:.2f})"
+                 return loss, True, "red", "⚠️ OVERLOAD", f"Quá tải (Loss: {loss:.2f})"
         else:
             return loss, False, "green", "✅ RUNNING", "Hoạt động ổn định"
             
@@ -156,7 +164,7 @@ def determine_status_logic(df_device, model, scaler, config):
 def create_gauge(value, title, max_val=5, color="green"):
     fig = go.Figure(go.Indicator(
         mode = "gauge+number", value = value,
-        title = {'text': title, 'font': {'size': 18, 'color': '#555'}},
+        title = {'text': title, 'font': {'size': 14, 'color': '#555'}},
         gauge = {
             'axis': {'range': [None, max_val], 'tickwidth': 1, 'tickcolor': "darkblue"},
             'bar': {'color': color},
@@ -165,119 +173,167 @@ def create_gauge(value, title, max_val=5, color="green"):
             'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': max_val * 0.9}
         }
     ))
-    fig.update_layout(height=200, margin=dict(t=40,b=10,l=25,r=25))
+    fig.update_layout(height=160, margin=dict(t=30,b=10,l=25,r=25))
     return fig
 
-def create_trend_chart(df, dev_name):
+def create_trend_chart(df, title_suffix):
     fig = go.Figure()
     if not df.empty:
         latest_time = df['time'].max()
-        window_start = latest_time - timedelta(minutes=30)
+        window_start = latest_time - timedelta(minutes=20)
         df_view = df[df['time'] >= window_start]
         
         fig.add_trace(go.Scatter(x=df_view['time'], y=df_view['Speed'], fill='tozeroy', mode='lines', line=dict(width=2, color='#0ea5e9'), name='Tốc độ'))
-        fig.add_trace(go.Scatter(x=df_view['time'], y=df_view['Temp'], mode='lines', line=dict(color='#f97316', dash='dot', width=2), yaxis='y2', name='Nhiệt độ'))
+        fig.add_trace(go.Scatter(x=df_view['time'], y=df_view['Temp'], mode='lines', line=dict(color='#f97316', dash='dot', width=1.5), yaxis='y2', name='Nhiệt độ'))
     
     fig.update_layout(
-        title=dict(text="Lịch sử 30 phút", font=dict(size=14, color="#555")),
-        height=250, margin=dict(l=10, r=10, t=40, b=10),
+        title=dict(text=f"Biến động {title_suffix}", font=dict(size=12, color="#555")),
+        height=200, margin=dict(l=10, r=10, t=30, b=10),
         xaxis=dict(showgrid=False, tickformat='%H:%M:%S'),
-        yaxis=dict(title="Speed", range=[0, 5]),
-        yaxis2=dict(title="Temp", overlaying='y', side='right', showgrid=False, range=[0, 80]),
+        yaxis=dict(title="Speed", range=[0, 5], showticklabels=False),
+        yaxis2=dict(overlaying='y', side='right', showgrid=False, range=[0, 80], showticklabels=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     return fig
 
 # ===============================================================
-# TAB 1: REAL-TIME MONITOR
+# TAB 1: REAL-TIME MONITOR (ĐÃ SỬA UI)
 # ===============================================================
 @st.fragment(run_every=REFRESH_RATE) 
 def render_realtime_content():
     now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
     st.caption(f"Last update: {now_str} (Live Mode)")
     
-    df_all = get_recent_data(300)
+    # Lấy dữ liệu 1 lần cho tối ưu
+    df_all = get_recent_data(500)
     
     if df_all.empty:
         st.warning("⏳ Đang chờ Worker bơm dữ liệu...")
         return
 
-    col1, col2 = st.columns(2)
-    cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
-
-    for dev in DEVICES:
-        df = df_all[df_all['DevAddr'] == dev].copy()
-        if df.empty: continue
+    # --- [FIX UI 2] Loop qua từng Device, rồi loop qua từng Channel ---
+    for dev_conf in DEVICES_CONFIG:
+        d_id = dev_conf['id']
+        d_name = dev_conf['name']
+        channels = dev_conf['channels']
         
-        last = df.iloc[-1]
-        current_col = cols_map[dev]
+        st.subheader(f"🏭 {d_name} ({d_id[-4:]})")
         
-        score, is_danger, color_code, status_text, log_msg = determine_status_logic(df, model, scaler, config)
-
-        if is_danger: st.session_state.buffer[dev] += 1
-        else: st.session_state.buffer[dev] = 0
+        # Tạo số cột tương ứng với số kênh (Làn)
+        cols = st.columns(len(channels))
         
-        final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
+        for idx, ch in enumerate(channels):
+            with cols[idx]:
+                # Tạo khóa duy nhất cho lane này
+                lane_key = f"{d_id}_{ch}"
+                
+                # Init Session State cho lane nếu chưa có
+                if lane_key not in st.session_state.buffer:
+                    st.session_state.buffer[lane_key] = 0
+                    st.session_state.logs[lane_key] = []
 
-        if final_is_anomaly:
-                if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
-                    st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
+                # --- [QUAN TRỌNG] Filter dữ liệu CHỈ CỦA CHANNEL NÀY ---
+                # Đây là bước sửa lỗi biểu đồ zig-zag
+                df_lane = df_all[
+                    (df_all['DevAddr'] == d_id) & 
+                    (df_all['Channel'] == ch)
+                ].copy()
+                
+                # Logic Xử lý
+                score, is_danger, color_code, status_text, log_msg = determine_status_logic(df_lane, model, scaler, config)
 
-        css_class = "status-ok"
-        if color_code == "red": css_class = "status-err"
-        elif color_code == "orange": css_class = "status-warn"
-        gauge_color = "#ef4444" if color_code == "red" else ("#f59e0b" if color_code == "orange" else "#10b981")
+                # Debounce Buffer
+                if is_danger: st.session_state.buffer[lane_key] += 1
+                else: st.session_state.buffer[lane_key] = 0
+                
+                final_is_anomaly = (st.session_state.buffer[lane_key] >= 2) or ("CRASH" in status_text)
 
-        with current_col:
-            with st.container(border=True):
-                h1, h2 = st.columns([2, 2])
-                h1.subheader(f"📡 {dev[-4:]}")
-                h2.markdown(f'<div class="{css_class}">{status_text}</div>', unsafe_allow_html=True)
+                # Ghi Log
+                if final_is_anomaly:
+                    last_log = st.session_state.logs[lane_key][-1] if st.session_state.logs[lane_key] else None
+                    if not last_log or last_log['msg'] != log_msg:
+                        st.session_state.logs[lane_key].append({'time': datetime.now().strftime('%H:%M:%S'), 'msg': log_msg})
 
-                st.markdown("---")
-                g1, g2 = st.columns(2)
-                chart_key = f"{dev}_{now_str}"
-                g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{chart_key}")
-                g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{chart_key}")
+                # Style CSS
+                css_class = "status-ok"
+                if color_code == "red": css_class = "status-err"
+                elif color_code == "orange": css_class = "status-warn"
+                gauge_color = "#ef4444" if color_code == "red" else ("#f59e0b" if color_code == "orange" else "#10b981")
 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Sản lượng", f"{last['Actual']:,}")
-                m2.metric("Runtime", f"{int(last['RunTime']/60)}m")
-                m3.metric("AI Score", f"{score:.3f}", delta="NGUY HIỂM" if final_is_anomaly else "Ổn định", delta_color="inverse")
+                # --- VẼ GIAO DIỆN CHO 1 LANE ---
+                with st.container(border=True):
+                    # Header Lane
+                    c1, c2 = st.columns([2, 2])
+                    c1.markdown(f"**Làn (Lane) {ch}**")
+                    c2.markdown(f'<div class="{css_class}">{status_text}</div>', unsafe_allow_html=True)
+                    
+                    if not df_lane.empty:
+                        last = df_lane.iloc[-1]
+                        
+                        # Gauge & Metric
+                        g1, g2 = st.columns(2)
+                        chart_id = f"{lane_key}_{now_str}"
+                        g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ", 5, gauge_color), use_container_width=True, key=f"g1_{chart_id}")
+                        
+                        with g2:
+                            st.metric("Sản lượng", f"{last['Actual']:,}")
+                            st.metric("Nhiệt độ", f"{last['Temp']}°C")
 
-                st.markdown("---")
-                st.plotly_chart(create_trend_chart(df, dev), use_container_width=True, key=f"trend_{chart_key}")
+                        # Biểu đồ Trend nhỏ
+                        st.plotly_chart(create_trend_chart(df_lane, f"Làn {ch}"), use_container_width=True, key=f"tr_{chart_id}")
+                        
+                        # Log sự cố
+                        if final_is_anomaly:
+                            st.error(f"⚠️ {log_msg}")
 
-                with st.expander("📝 Nhật ký sự cố", expanded=final_is_anomaly):
-                    if st.session_state.logs[dev]:
-                        st.dataframe(pd.DataFrame(st.session_state.logs[dev]).iloc[::-1].head(5), hide_index=True, use_container_width=True)
                     else:
-                        st.info("Chưa ghi nhận sự cố nào.")
+                        st.info("Chưa có dữ liệu làn này")
+
+        st.markdown("---") # Ngăn cách giữa các máy
 
 # ===============================================================
-# TAB 2: ANALYTICS (FIX CHART TYPE)
+# TAB 2: ANALYTICS (ĐÃ SỬA CHỌN LANE)
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất & Dự báo")
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        days_back = st.slider("Thời gian (Ngày):", 1, 30, 7)
-        selected_dev = st.selectbox("Chọn thiết bị:", DEVICES)
-        if st.button("Tải dữ liệu"):
-            st.rerun()
     
-    # Lấy dữ liệu lịch sử
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        # Chọn Máy (Hiển thị tên cho đẹp)
+        dev_options = {d['name']: d['id'] for d in DEVICES_CONFIG}
+        selected_name = st.selectbox("Chọn thiết bị:", list(dev_options.keys()))
+        selected_dev_id = dev_options[selected_name]
+    
+    with col2:
+        # Chọn Làn (Dynamic theo máy)
+        # Tìm config của máy đang chọn
+        curr_conf = next(item for item in DEVICES_CONFIG if item["id"] == selected_dev_id)
+        selected_channel = st.selectbox("Chọn Làn (Channel):", curr_conf['channels'])
+
+    with col3:
+        days_back = st.slider("Ngày:", 1, 30, 7)
+        if st.button("Tải dữ liệu"): st.rerun()
+    
+    # Lấy dữ liệu lịch sử CÓ LỌC CHANNEL
     start_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
     try:
-        response = supabase.table("sensor_data").select("time, Speed, Temp, Actual").eq("DevAddr", selected_dev).gte("time", start_date).order("time", desc=False).execute()
+        response = supabase.table("sensor_data")\
+            .select("time, Speed, Temp, Actual, Channel")\
+            .eq("DevAddr", selected_dev_id)\
+            .eq("Channel", selected_channel)\
+            .gte("time", start_date)\
+            .order("time", desc=False)\
+            .execute()
+            
         df = pd.DataFrame(response.data)
         if df.empty:
-            st.warning("Chưa có dữ liệu.")
+            st.warning("Chưa có dữ liệu cho Làn này.")
             return
         
         df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
         df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
         
+        # --- PHẦN DƯỚI GIỮ NGUYÊN LOGIC CŨ NHƯNG DATA ĐÃ SẠCH ---
         # Thống kê cơ bản
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Tốc độ TB", f"{df['Speed'].mean():.2f}")
@@ -299,23 +355,17 @@ def render_analytics_tab():
             st.plotly_chart(fig_pie, use_container_width=True)
         with c2:
             st.subheader("📈 Xu hướng Quá khứ")
-            fig_line = px.line(df, x='time', y='Speed', title="Biểu đồ tốc độ theo thời gian")
+            fig_line = px.line(df, x='time', y='Speed', title=f"Tốc độ Làn {selected_channel}")
             st.plotly_chart(fig_line, use_container_width=True)
             
         st.markdown("---")
         
-        # --- DỰ BÁO 3 NGÀY ---
-        st.subheader("🔮 Dự báo Sản lượng & Hiệu suất (3 Ngày tới)")
-        st.caption("Dữ liệu được dự báo dựa trên mô hình phân tích chuỗi thời gian (Time-series Forecasting).")
+        # --- DỰ BÁO 3 NGÀY (GIỮ NGUYÊN LOGIC) ---
+        st.subheader(f"🔮 Dự báo Làn {selected_channel} (3 Ngày tới)")
         
         if len(df) > 100:
             running_data = df[df['Speed'] > 0.5]['Speed'].tail(5000)
-            if not running_data.empty:
-                recent_avg_speed = running_data.mean()
-            else:
-                recent_avg_speed = 2.5 
-            
-            # Tính độ lệch chuẩn
+            recent_avg_speed = running_data.mean() if not running_data.empty else 2.5
             std_dev = df['Speed'].tail(1000).std()
             if pd.isna(std_dev) or std_dev == 0: std_dev = recent_avg_speed * 0.1
 
@@ -324,62 +374,33 @@ def render_analytics_tab():
             future_times = [last_time + timedelta(hours=i+1) for i in range(future_steps)]
             
             future_speeds = []
-            
             for i in range(future_steps):
                 hour_of_day = (last_time.hour + i) % 24
                 if 7 <= hour_of_day <= 18: factor = 1.1 
                 else: factor = 0.9 
-                
                 base_val = recent_avg_speed * factor
                 noise = np.random.uniform(-0.5, 0.5) * std_dev
-                
                 final_val = max(0, base_val + noise)
                 future_speeds.append(final_val)
             
-            df_future = pd.DataFrame({
-                'time': future_times,
-                'Speed_Forecast': future_speeds
-            })
-            
-            df_future['Production_Hourly'] = df_future['Speed_Forecast'] * 180
-            total_predicted_prod = df_future['Production_Hourly'].sum()
+            df_future = pd.DataFrame({'time': future_times, 'Speed_Forecast': future_speeds})
             
             col_pred1, col_pred2 = st.columns([1, 3])
-            
             with col_pred1:
-                st.success(f"Dự báo tổng sản lượng:\n\n# {int(total_predicted_prod):,} SP")
-                st.info(f"Tốc độ TB dự kiến:\n\n**{df_future['Speed_Forecast'].mean():.2f}** (sp/20s)")
-                st.caption("Dựa trên năng lực vận hành thực tế.")
+                st.success(f"Dự kiến sản lượng:\n\n# {int(df_future['Speed_Forecast'].sum() * 180):,} SP")
+                st.info(f"Tốc độ TB:\n\n**{df_future['Speed_Forecast'].mean():.2f}**")
             
             with col_pred2:
                 fig_forecast = go.Figure()
-                
-                # Thực tế (24h qua)
-                df_last_24h = df.tail(4320) 
-                fig_forecast.add_trace(go.Scatter(x=df_last_24h['time'], y=df_last_24h['Speed'], name='Thực tế (24h qua)', line=dict(color='#0ea5e9', width=2)))
-                
-                # Dự báo (3 ngày tới) - CÓ HIỂN THỊ SỐ
+                df_last_24h = df.tail(1000) 
+                fig_forecast.add_trace(go.Scatter(x=df_last_24h['time'], y=df_last_24h['Speed'], name='Thực tế', line=dict(color='#0ea5e9', width=1)))
                 fig_forecast.add_trace(go.Bar(
-                    x=df_future['time'], 
-                    y=df_future['Speed_Forecast'], 
-                    name='Dự báo', 
+                    x=df_future['time'], y=df_future['Speed_Forecast'], name='Dự báo', 
                     marker=dict(color='#f97316', opacity=0.7),
-                    # --- HIỂN THỊ SỐ TRÊN CỘT ---
-                    text=[f'{val:.0f}' for val in df_future['Speed_Forecast']], # Làm tròn thành số nguyên cho gọn
-                    textposition='auto', # Tự động căn chỉnh
                     hovertemplate='Thời gian: %{x}<br>Tốc độ: %{y:.2f}<extra></extra>'
                 ))
-                
-                fig_forecast.update_layout(
-                    title="Biểu đồ dự báo biến động tốc độ",
-                    xaxis_title="Thời gian",
-                    yaxis_title="Tốc độ (Speed)",
-                    height=400, # Tăng chiều cao xíu cho thoáng
-                    legend=dict(orientation="h", y=1.1),
-                    barmode='overlay'
-                )
+                fig_forecast.update_layout(title="Dự báo Tốc độ", height=400, barmode='overlay', legend=dict(orientation="h", y=1.1))
                 st.plotly_chart(fig_forecast, use_container_width=True)
-                
         else:
             st.info("⚠️ Cần ít nhất 100 điểm dữ liệu để chạy mô hình dự báo.")
 
