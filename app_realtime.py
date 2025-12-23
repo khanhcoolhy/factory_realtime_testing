@@ -12,32 +12,32 @@ from datetime import datetime, timedelta
 from supabase import create_client
 
 # ===============================================================
-# 1. CẤU HÌNH GIAO DIỆN & KẾT NỐI
+# 1. CẤU HÌNH & KẾT NỐI
 # ===============================================================
-st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="Stanley Monitor", layout="wide", page_icon="🏭")
 
-# CSS: Tùy chỉnh giao diện Sidebar và Card
+# CSS: Tùy chỉnh Sidebar & Card cho đẹp
 st.markdown("""
 <style>
-    /* Chỉnh lại font size cho Sidebar */
+    /* Chỉnh Menu bên trái to và rõ hơn */
     [data-testid="stSidebar"] {
-        background-color: #f8f9fa;
+        background-color: #f0f2f6;
+        padding-top: 20px;
     }
     .stRadio [data-testid="stMarkdownContainer"] > p {
-        font-size: 18px; /* Chữ menu to hơn */
+        font-size: 18px;
         font-weight: 600;
-        padding-top: 10px;
-        padding-bottom: 10px;
+        padding: 10px 0px;
     }
     
-    /* Status Badges */
+    /* Status Badge */
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #badbcc; }
     .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #f5c2c7; }
     .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #ffeeba; }
     .status-gray { background-color: #e2e3e5; color: #41464b; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #d3d6d8; }
     
-    /* Metrics font */
-    div[data-testid="stMetricValue"] { font-size: 24px !important; color: #333; }
+    /* Font số liệu to */
+    div[data-testid="stMetricValue"] { font-size: 26px !important; color: #333; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -56,7 +56,7 @@ try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 except:
-    st.error("❌ Lỗi: Thiếu Secrets SUPABASE_URL hoặc SUPABASE_KEY")
+    st.error("❌ Lỗi: Thiếu Secrets!")
     st.stop()
 
 @st.cache_resource
@@ -76,7 +76,6 @@ def load_ai():
     try:
         cfg = joblib.load(c_path)
         scl = joblib.load(s_path)
-        
         class LSTMModel(nn.Module):
             def __init__(self, n_features, hidden_dim=128, num_layers=3, dropout=0.2):
                 super(LSTMModel, self).__init__()
@@ -86,7 +85,6 @@ def load_ai():
                 out, _ = self.lstm(x)
                 out = self.fc(out[:, -1, :])
                 return out
-
         model = LSTMModel(n_features=cfg['n_features'], hidden_dim=cfg['hidden_dim'])
         model.load_state_dict(torch.load(m_path, map_location='cpu'))
         model.eval()
@@ -123,9 +121,11 @@ def predict_anomaly(df_lane, model, scaler, config):
         data_segment = df_lane[features].tail(SEQ_LEN + 1).values
         data_log = np.log1p(data_segment)
         data_scaled = scaler.transform(data_log)
+        
         X_input = torch.tensor(data_scaled[:-1], dtype=torch.float32).unsqueeze(0)
         with torch.no_grad(): Y_pred = model(X_input).numpy()[0]
         Y_actual = data_scaled[-1]
+        
         target_idx = config.get('target_cols_idx', [0, 1, 2])
         loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
         return loss, loss > config['threshold']
@@ -150,7 +150,6 @@ def determine_status(df_lane):
             clr = "orange" if last['Speed'] < 1.5 else "red"
             return loss, True, clr, stt, f"AI Loss: {loss:.3f}"
         return loss, False, "green", "✅ ỔN ĐỊNH", "Hoạt động tốt"
-    
     return 0.0, False, "gray", "LOADING", "Loading AI..."
 
 # ===============================================================
@@ -171,7 +170,9 @@ def create_gauge(val, title, color):
     return fig
 
 def render_lane_card(dev_id, ch, df_lane):
+    """Vẽ 1 Làn (Card)"""
     now_str = datetime.now().strftime('%H:%M:%S')
+    
     if df_lane.empty:
         st.warning(f"Làn {ch}: Chưa có dữ liệu")
         return
@@ -193,10 +194,13 @@ def render_lane_card(dev_id, ch, df_lane):
 
     # CARD UI
     with st.container(border=True):
-        c1, c2 = st.columns([1.5, 1])
-        c1.markdown(f"#### 🛣️ Làn {ch}")
+        # Header Làn
+        c1, c2 = st.columns([1, 1])
+        c1.markdown(f"### 🛣️ LÀN {ch}")
         c2.markdown(f'<div class="{css}" style="text-align:center">{status_text}</div>', unsafe_allow_html=True)
         st.divider()
+        
+        # Chỉ số & Đồng hồ
         g_col, m_col = st.columns([1, 1.2])
         with g_col:
             st.plotly_chart(create_gauge(last['Speed'], "Tốc độ", gauge_col), use_container_width=True, key=f"g_{dev_id}_{ch}_{now_str}")
@@ -204,81 +208,91 @@ def render_lane_card(dev_id, ch, df_lane):
             st.markdown(f"📦 **SL:** `{int(last['Actual']):,}`")
             st.markdown(f"⏱️ **Run:** `{int(last.get('RunTime',0)/60)}p`")
             st.markdown(f"🌡️ **Temp:** `{last.get('Temp',0):.1f}°C`")
-            st.markdown(f"🧠 **Loss:** `{score:.3f}`")
+            st.markdown(f"🧠 **AI:** `{score:.3f}`")
         
-        # Sparkline
+        # Biểu đồ nhỏ
         chart_data = df_lane.tail(50)
-        fig = px.line(chart_data, x='time', y='Speed', height=120)
+        fig = px.line(chart_data, x='time', y='Speed', height=130)
         fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(visible=False), yaxis=dict(visible=True, range=[0, 5]))
         st.plotly_chart(fig, use_container_width=True, key=f"c_{dev_id}_{ch}_{now_str}")
 
+        # Logs
         with st.expander("📝 Nhật ký", expanded=final_alert):
             if st.session_state.logs[key]:
                 l_df = pd.DataFrame(st.session_state.logs[key])
                 l_df['time'] = l_df['time'].dt.strftime('%H:%M:%S')
                 st.dataframe(l_df.iloc[::-1].head(5), hide_index=True, use_container_width=True)
-            else: st.caption("Ổn định.")
+            else: st.caption("Hệ thống ổn định.")
 
 # ===============================================================
 # 4. MAIN LAYOUT (SIDEBAR MENU)
 # ===============================================================
-# TẠO MENU BÊN TRÁI
+
+# 1. TẠO MENU BÊN TRÁI (SIDEBAR)
 with st.sidebar:
-    st.title("🏭 DASHBOARD")
+    st.image("https://cdn-icons-png.flaticon.com/512/3061/3061341.png", width=60)
+    st.title("STANLEY IOT")
     st.markdown("---")
     
-    # Menu chọn dạng Radio nhưng nhìn giống nút bấm
-    selected_page = st.radio(
-        "CHỌN KHU VỰC:",
+    # Menu chọn dạng Radio
+    page = st.radio(
+        "KHU VỰC GIÁM SÁT:",
         [
-            f"🏗️ MÁY 1\n({DEVICES[0][-4:]})", 
-            f"🏗️ MÁY 2\n({DEVICES[1][-4:]})", 
+            "🏗️ MÁY 1 (77DA)", 
+            "🏗️ MÁY 2 (8797)", 
             "📊 ANALYTICS"
         ],
         index=0
     )
-    
     st.markdown("---")
     st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')}")
 
-# Lấy dữ liệu 1 lần
+# Load dữ liệu chung
 df_all = get_recent_data(1000)
 
+# 2. XỬ LÝ HIỂN THỊ DỰA TRÊN MENU ĐÃ CHỌN
+# (Lưu ý: Không dùng st.tabs nữa, thay vào đó là if/elif check page)
+
 # --- TRANG MÁY 1 ---
-if "MÁY 1" in selected_page:
-    st.header(f"📡 Giám sát Realtime: {DEVICES[0]}")
+if "MÁY 1" in page:
+    st.header(f"📡 Dashboard Realtime: {DEVICES[0]}")
     if not df_all.empty:
-        col_left, col_right = st.columns(2)
+        # TẠO 2 CỘT ĐỐI XỨNG (SYMMETRICAL)
+        col1, col2 = st.columns(2)
         dev = DEVICES[0]
         
+        # Lọc dữ liệu
         df_l1 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "01")].sort_values('time')
         df_l2 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "02")].sort_values('time')
         
-        with col_left: render_lane_card(dev, "01", df_l1)
-        with col_right: render_lane_card(dev, "02", df_l2)
+        # Render song song
+        with col1: render_lane_card(dev, "01", df_l1)
+        with col2: render_lane_card(dev, "02", df_l2)
     else: st.info("⏳ Đang tải dữ liệu Máy 1...")
 
 # --- TRANG MÁY 2 ---
-elif "MÁY 2" in selected_page:
-    st.header(f"📡 Giám sát Realtime: {DEVICES[1]}")
+elif "MÁY 2" in page:
+    st.header(f"📡 Dashboard Realtime: {DEVICES[1]}")
     if not df_all.empty:
-        col_left, col_right = st.columns(2)
+        # TẠO 2 CỘT ĐỐI XỨNG
+        col1, col2 = st.columns(2)
         dev = DEVICES[1]
         
         df_l1 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "01")].sort_values('time')
         df_l2 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "02")].sort_values('time')
         
-        with col_left: render_lane_card(dev, "01", df_l1)
-        with col_right: render_lane_card(dev, "02", df_l2)
+        with col1: render_lane_card(dev, "01", df_l1)
+        with col2: render_lane_card(dev, "02", df_l2)
     else: st.info("⏳ Đang tải dữ liệu Máy 2...")
 
 # --- TRANG ANALYTICS ---
-elif "ANALYTICS" in selected_page:
+elif "ANALYTICS" in page:
     st.header("📊 Phân tích & Báo cáo")
+    
     c_sel, _ = st.columns([1, 2])
     with c_sel:
-        otp = st.selectbox("Chọn Làn để xem:", [f"{d[-4:]} - Làn {c}" for d in DEVICES for c in CHANNELS])
-        days = st.slider("Thời gian:", 1, 30, 7)
+        otp = st.selectbox("Chọn Làn chi tiết:", [f"{d[-4:]} - Làn {c}" for d in DEVICES for c in CHANNELS])
+        days = st.slider("Thời gian (ngày):", 1, 30, 7)
         btn = st.button("Tải dữ liệu")
     
     if btn:
@@ -292,10 +306,12 @@ elif "ANALYTICS" in selected_page:
         
         if not df_his.empty:
             df_his['time'] = pd.to_datetime(df_his['time']).dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
+            
             k1, k2, k3 = st.columns(3)
-            k1.metric("Speed TB", f"{df_his['Speed'].mean():.2f}")
-            k2.metric("Tổng SL", f"{df_his['Actual'].max() - df_his['Actual'].min():,}")
+            k1.metric("Tốc độ TB", f"{df_his['Speed'].mean():.2f}")
+            k2.metric("Tổng Sản lượng", f"{df_his['Actual'].max() - df_his['Actual'].min():,}")
             k3.metric("Số bản ghi", f"{len(df_his)}")
+            
             st.plotly_chart(px.line(df_his, x='time', y='Speed', title=f"Biểu đồ Tốc độ: {otp}"), use_container_width=True)
             st.plotly_chart(px.histogram(df_his, x='Speed', title="Phân bố tốc độ"), use_container_width=True)
         else: st.warning("Không có dữ liệu.")
