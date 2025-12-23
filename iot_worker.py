@@ -8,7 +8,7 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 
-print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu FULL 4 LÀN (2 Máy x 2 Kênh)...")
+print("🤖 IOT WORKER: Bắt đầu bơm dữ liệu CHUẨN + SỰ CỐ (Simulation)...")
 
 # --- LẤY KEY TỪ MÔI TRƯỜNG ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -18,17 +18,12 @@ if not SUPABASE_URL:
     print("❌ Lỗi: Thiếu Key Supabase!")
     exit()
 
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    print(f"❌ Lỗi kết nối Supabase: {e}")
-    exit()
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ==========================================
-# CẤU HÌNH CHUẨN: 2 MÁY - 4 LÀN
-# ==========================================
-DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-CHANNELS = ["01", "02"]
+DEVICES = [
+    {"id": "4417930D77DA", "ch": "01"},
+    {"id": "AC0BFBCE8797", "ch": "02"}
+]
 
 # API Thời tiết
 def get_weather():
@@ -44,7 +39,7 @@ def get_weather():
     except: return 25.0, 70.0
 
 def run_worker_batch():
-    # --- CẤU HÌNH CHẠY ---
+    # --- CẤU HÌNH ---
     INTERVAL_SECONDS = 20  
     POINTS_PER_RUN = 60    # Sinh 20 phút dữ liệu mỗi lần chạy
     
@@ -54,93 +49,87 @@ def run_worker_batch():
     # Lùi thời gian lại để bơm dữ liệu nối tiếp nhau
     start_time_base = datetime.now() - timedelta(seconds=POINTS_PER_RUN * INTERVAL_SECONDS)
 
-    # ==========================================
-    # LOGIC MỚI: DUYỆT QUA TỪNG MÁY VÀ TỪNG KÊNH
-    # ==========================================
-    for dev_id in DEVICES:      # Loop 1: Chạy qua 2 máy
-        for ch in CHANNELS:     # Loop 2: Chạy qua 2 kênh (01, 02)
+    for dev in DEVICES:
+        dev_id = dev['id']
+        ch = dev['ch']
+        
+        # 1. Lấy trạng thái cũ
+        curr_actual = 1000000; curr_runtime = 5000000; curr_heldtime = 2000000
+        try:
+            res = supabase.table("sensor_data").select("*").eq("DevAddr", dev_id).order("time", desc=True).limit(1).execute()
+            if res.data:
+                last = res.data[0]
+                curr_actual = last['Actual']
+                curr_runtime = last['RunTime']
+                curr_heldtime = last['HeldTime']
+        except: pass
+
+        # 2. Vòng lặp sinh dữ liệu
+        for i in range(POINTS_PER_RUN):
+            point_time = start_time_base + timedelta(seconds=(i + 1) * INTERVAL_SECONDS)
             
-            # 1. Lấy trạng thái cũ của RIÊNG làn này (Dev + Channel)
-            curr_actual = 1000000; curr_runtime = 5000000; curr_heldtime = 2000000
-            try:
-                # Query phải lọc cả DevAddr VÀ Channel
-                res = supabase.table("sensor_data")\
-                    .select("*")\
-                    .eq("DevAddr", dev_id)\
-                    .eq("Channel", ch)\
-                    .order("time", desc=True)\
-                    .limit(1)\
-                    .execute()
-                    
-                if res.data:
-                    last = res.data[0]
-                    curr_actual = last['Actual']
-                    curr_runtime = last['RunTime']
-                    curr_heldtime = last['HeldTime']
-            except: pass
+            # --- LOGIC MÔ PHỎNG 3 TRẠNG THÁI ---
+            rand_val = random.random()
+            
+            # Kịch bản phân phối:
+            # 70% Chạy bình thường
+            # 25% Nghỉ (Idle)
+            # 5%  Sự cố (Crash) -> Để test hệ thống cảnh báo
+            
+            if rand_val < 0.05: 
+                # === TRƯỜNG HỢP 1: CRASH (SỰ CỐ) ===
+                status = 2 # Error
+                speed = 0
+                d_runtime = 0.0
+                d_heldtime = float(INTERVAL_SECONDS)
+                temp = base_temp + random.uniform(20.0, 30.0) # Nóng
 
-            # 2. Sinh chuỗi dữ liệu nối tiếp
-            for i in range(POINTS_PER_RUN):
-                point_time = start_time_base + timedelta(seconds=(i + 1) * INTERVAL_SECONDS)
+            elif rand_val < 0.30:
+                # === TRƯỜNG HỢP 2: IDLE (NGHỈ) ===
+                status = 1 
+                speed = 0
+                d_runtime = 0.0
+                d_heldtime = float(INTERVAL_SECONDS)
+                temp = base_temp + random.uniform(0.5, 2.0) # Mát
                 
-                # Logic ngẫu nhiên (Simulation)
-                rand_val = random.random()
-                
-                if rand_val < 0.05: # SỰ CỐ (CRASH)
-                    status = 2 
-                    speed = 0
-                    d_runtime = 0.0
-                    d_heldtime = float(INTERVAL_SECONDS)
-                    temp = base_temp + random.uniform(20.0, 30.0) # Nóng
+            else:
+                # === TRƯỜNG HỢP 3: RUNNING (CHẠY) ===
+                status = 1
+                speed = random.choices([0, 1, 2], weights=[0.2, 0.75, 0.05])[0]
+                d_runtime = float(INTERVAL_SECONDS)
+                d_heldtime = 0.0
+                temp = base_temp + random.uniform(5.0, 10.0) # Ấm
+            
+            # Cập nhật cộng dồn
+            curr_actual += speed
+            curr_runtime += d_runtime
+            curr_heldtime += d_heldtime
+            
+            record = {
+                "time": point_time.isoformat(),
+                "DevAddr": dev_id, 
+                "Channel": ch,
+                "Actual": curr_actual, 
+                "Status": status,
+                "RunTime": float(curr_runtime), 
+                "HeldTime": float(curr_heldtime),
+                "Speed": float(speed),
+                "d_RunTime": d_runtime,
+                "d_HeldTime": d_heldtime,
+                "Temp": float(f"{temp:.2f}"), 
+                "Humidity": base_hum
+            }
+            all_payloads.append(record)
 
-                elif rand_val < 0.30: # NGHỈ (IDLE)
-                    status = 1 
-                    speed = 0
-                    d_runtime = 0.0
-                    d_heldtime = float(INTERVAL_SECONDS)
-                    temp = base_temp + random.uniform(0.5, 2.0)
-                    
-                else: # CHẠY (RUNNING)
-                    status = 1
-                    speed = random.choices([0, 1, 2], weights=[0.2, 0.75, 0.05])[0]
-                    d_runtime = float(INTERVAL_SECONDS)
-                    d_heldtime = 0.0
-                    temp = base_temp + random.uniform(5.0, 10.0)
-                
-                # Cộng dồn
-                curr_actual += speed
-                curr_runtime += d_runtime
-                curr_heldtime += d_heldtime
-                
-                record = {
-                    "time": point_time.isoformat(),
-                    "DevAddr": dev_id, 
-                    "Channel": ch,          # <--- Lưu đúng Channel (01 hoặc 02)
-                    "Actual": curr_actual, 
-                    "Status": status,
-                    "RunTime": float(curr_runtime), 
-                    "HeldTime": float(curr_heldtime),
-                    "Speed": float(speed),
-                    "d_RunTime": d_runtime,
-                    "d_HeldTime": d_heldtime,
-                    "Temp": float(f"{temp:.2f}"), 
-                    "Humidity": base_hum
-                }
-                all_payloads.append(record)
-
-    # 3. Gửi lên Supabase (Chia batch để tránh lỗi quá tải)
+    # 3. Gửi lên Supabase
     if all_payloads:
         try:
-            # Gửi gói nhỏ 1000 dòng/lần
-            batch_size = 1000
-            for i in range(0, len(all_payloads), batch_size):
-                batch = all_payloads[i:i + batch_size]
-                supabase.table("sensor_data").insert(batch).execute()
-                
-            print(f"✅ Đã bơm thành công {len(all_payloads)} dòng dữ liệu (4 Làn)!")
+            supabase.table("sensor_data").insert(all_payloads).execute()
+            print(f"✅ Đã bơm {len(all_payloads)} điểm dữ liệu (Job hoàn tất)!")
         except Exception as e:
-            print(f"❌ Lỗi Insert: {e}")
+            print(f"❌ Lỗi: {e}")
 
 # --- ENTRY POINT ---
 if __name__ == "__main__":
+    # CHỈ CHẠY 1 LẦN RỒI THOÁT (để GitHub Actions báo Success)
     run_worker_batch()

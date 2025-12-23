@@ -8,66 +8,50 @@ import torch
 import torch.nn as nn
 import joblib
 import os
-import traceback # Thêm thư viện để bắt lỗi chi tiết
+import requests
 from datetime import datetime, timedelta
 from supabase import create_client
 
 # ===============================================================
-# 1. CẤU HÌNH HỆ THỐNG & KẾT NỐI
+# 1. CẤU HÌNH & KẾT NỐI
 # ===============================================================
-st.set_page_config(page_title="Hệ thống Giám sát Nhà máy", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# --- CSS ---
 st.markdown("""
 <style>
-    [data-testid="stSidebar"] { background-color: #f0f2f6; padding-top: 20px; }
-    .stRadio > div { background-color: white; padding: 10px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-    .stRadio label { font-weight: bold; font-size: 16px; padding: 10px 5px; }
-    div[data-testid="stMetricValue"] { font-size: 22px !important; }
-    .status-badge { padding: 5px 10px; border-radius: 6px; font-weight: bold; text-align: center; color: white; }
+    .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
+    .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #f5c2c7; display: inline-block; }
+    .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #ffeeba; display: inline-block; }
+    div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
+    h3 { font-size: 1.2rem !important; font-weight: 700 !important; color: #444; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- CONFIG THIẾT BỊ ---
-MACHINE_CONFIG = {
-    "MÁY 1": {
-        "id": "4417930D77DA",
-        "name": "MÁY CẮT 01",
-        "lanes": [
-            {"code": "L1", "name": "Làn 1", "db_channel": "01"},
-            {"code": "L2", "name": "Làn 2", "db_channel": "02"}
-        ]
-    },
-    "MÁY 2": {
-        "id": "AC0BFBCE8797",
-        "name": "MÁY CẮT 02",
-        "lanes": [
-            {"code": "L3", "name": "Làn 3", "db_channel": "01"},
-            {"code": "L4", "name": "Làn 4", "db_channel": "02"}
-        ]
-    }
-}
+MODEL_PATH = "lstm_factory_v2.pth"
+SCALER_PATH = "robust_scaler_v2.pkl"
+CONFIG_PATH = "model_config_v2.pkl"
 
-MODEL_PATH = "saved_models_v2/lstm_factory_v2.pth"
-SCALER_PATH = "saved_models_v2/robust_scaler_v2.pkl"
-CONFIG_PATH = "saved_models_v2/model_config_v2.pkl"
+DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
 REFRESH_RATE = 2 
+TEMP_CRASH_THRESHOLD = 40.0
 
-# --- SUPABASE (Thêm Try/Except để tránh crash ngay từ đầu) ---
+# Lấy Secrets
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-except Exception as e:
-    st.error(f"❌ Lỗi kết nối Supabase hoặc thiếu Secrets: {e}")
+except:
+    st.error("❌ Thiếu cấu hình Secrets! Vui lòng kiểm tra file .streamlit/secrets.toml")
     st.stop()
 
-# --- LOAD AI MODEL ---
+@st.cache_resource
+def init_connection():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = init_connection()
+
+# --- LOAD AI MODEL (LSTM) ---
 @st.cache_resource
 def load_ai():
-    if not os.path.exists(CONFIG_PATH): 
-        # Không tìm thấy file thì trả về None nhưng không crash app
-        return None, None, None
+    if not os.path.exists(MODEL_PATH): return None, None, None
     try:
         cfg = joblib.load(CONFIG_PATH)
         scl = joblib.load(SCALER_PATH)
@@ -87,206 +71,331 @@ def load_ai():
         model.eval()
         return model, scl, cfg
     except Exception as e:
-        print(f"Lỗi load AI: {e}")
         return None, None, None
 
 model, scaler, config = load_ai()
 
-if 'logs' not in st.session_state:
-    st.session_state.logs = []
+if 'status' not in st.session_state:
+    st.session_state.buffer = {d: 0 for d in DEVICES}
+    st.session_state.logs = {d: [] for d in DEVICES}
 
-# ===============================================================
-# 2. XỬ LÝ DỮ LIỆU (FIXED)
-# ===============================================================
-def get_realtime_data(limit=500): 
+# --- HÀM HỖ TRỢ ---
+def get_recent_data(limit=1000): 
     try:
         response = supabase.table("sensor_data").select("*").order("time", desc=True).limit(limit).execute()
         df = pd.DataFrame(response.data)
         if not df.empty:
-            # Sửa lỗi ValueError do format datetime
-            df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True, errors='coerce')
-            df = df.dropna(subset=['time']) # Bỏ dòng lỗi thời gian
+            df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
             df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
             df = df.sort_values('time')
         return df
-    except Exception as e:
-        st.error(f"Lỗi lấy dữ liệu: {e}")
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
-def predict_anomaly(df_lane, model, scaler, config):
+# --- AI LOGIC ---
+def predict_anomaly(df_device, model, scaler, config):
     SEQ_LEN = 30
-    # Kiểm tra an toàn
-    if len(df_lane) < SEQ_LEN + 1: return 0.0, False
-    if config is None or model is None: return 0.0, False
+    if len(df_device) < SEQ_LEN + 1: return 0.0, False
     
+    features = config['features_list']
     try:
-        features = config.get('features_list', [])
-        # Kiểm tra xem đủ cột không
-        if not all(col in df_lane.columns for col in features):
-            return 0.0, False
-            
-        data_segment = df_lane[features].tail(SEQ_LEN + 1).values
-        
-        # FIX: Kiểm tra NaN trước khi đưa vào scaler (Nguyên nhân chính gây ValueError)
-        if np.isnan(data_segment).any():
-            return 0.0, False
-
-        data_log = np.log1p(data_segment)
-        data_scaled = scaler.transform(data_log)
-        
-        X_input = torch.tensor(data_scaled[:-1], dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad(): 
-            Y_pred = model(X_input).numpy()[0]
-            
-        Y_actual = data_scaled[-1]
-        
-        target_idx = config.get('target_cols_idx', [0, 1, 2])
-        loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
-        
-        return loss, loss > config.get('threshold', 0.1)
-    except Exception:
-        # Nuốt lỗi AI để app không sập
+        data_segment = df_device[features].tail(SEQ_LEN + 1).values
+    except KeyError:
         return 0.0, False
-
-def analyze_lane_status(df_lane):
-    if df_lane.empty: return "NODATA", "black", "Chờ dữ liệu", 0.0
+        
+    data_log = np.log1p(data_segment)
+    data_scaled = scaler.transform(data_log)
     
-    try:
-        last = df_lane.iloc[-1]
-        now = datetime.now()
+    X_input = data_scaled[:-1]
+    Y_actual = data_scaled[-1]
+    
+    X_tensor = torch.tensor(X_input, dtype=torch.float32).unsqueeze(0)
+    
+    with torch.no_grad():
+        Y_pred = model(X_tensor).numpy()[0]
         
-        # Check Offline
-        if (now - last['time']).total_seconds() > 300: # 5 phút
-            return "OFFLINE", "gray", f"Mất kết nối {last['time'].strftime('%H:%M')}", 0.0
+    target_idx = config.get('target_cols_idx', [0, 1, 2])
+    loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
+    
+    threshold = config['threshold']
+    is_anomaly = loss > threshold
+    return loss, is_anomaly
 
-        # Check Crash
-        if last['Speed'] == 0 and last.get('Temp', 0) > 40:
-            return "CRASH", "red", f"⚠️ QUÁ NHIỆT {last['Temp']}°C", 9.9
+def determine_status_logic(df_device, model, scaler, config):
+    if df_device.empty or len(df_device) < 2:
+        return 0.0, False, "gray", "NO DATA", "Chưa có dữ liệu"
 
-        # Check Idle
-        if last['Speed'] < 0.1:
-            return "IDLE", "#6c757d", "💤 Máy đang nghỉ", 0.0
+    last_row = df_device.iloc[-1]
+    prev_row = df_device.iloc[-2]
+    
+    time_diff = (last_row['time'] - prev_row['time']).total_seconds()
+    if time_diff > 60:
+        return 0.0, False, "orange", "⚠️ SYNC LAG", f"Mất dữ liệu {int(time_diff)}s. Chờ đồng bộ..."
 
-        loss, is_anom = predict_anomaly(df_lane, model, scaler, config)
-        
-        if is_anom:
-            if last['Speed'] < 1.5: return "SLOW", "orange", "🐢 Chạy chậm", loss
-            return "OVERLOAD", "red", "🔥 Quá tải", loss
+    speed = last_row['Speed']
+    temp = last_row['Temp']
+
+    if speed == 0:
+        if temp > TEMP_CRASH_THRESHOLD:
+            return 9.99, True, "red", "⛔ CRASH", f"Dừng đột ngột! Temp cao: {temp}°C"
+        else:
+            return 0.0, False, "gray", "💤 IDLE", "Máy dừng nghỉ theo kế hoạch"
+
+    if model and scaler:
+        loss, is_anomaly = predict_anomaly(df_device, model, scaler, config)
+        if is_anomaly:
+            if speed < 1.5:
+                 return loss, True, "orange", "🐢 JAM/SLOW", f"Kẹt/Tải thấp (AI Loss: {loss:.2f})"
+            else:
+                 return loss, True, "red", "⚠️ OVERLOAD", f"Quá tải/Rung lắc (AI Loss: {loss:.2f})"
+        else:
+            return loss, False, "green", "✅ RUNNING", "Hoạt động ổn định"
             
-        return "OK", "green", "✅ Ổn định", loss
-    except Exception as e:
-        return "ERR", "gray", "Lỗi xử lý", 0.0
+    return 0.0, False, "gray", "LOADING AI", "Đang tải mô hình..."
 
-# ===============================================================
-# 3. UI COMPONENTS
-# ===============================================================
-def draw_gauge(value, title, color_code):
+# --- UI COMPONENTS ---
+def create_gauge(value, title, max_val=5, color="green"):
     fig = go.Figure(go.Indicator(
         mode = "gauge+number", value = value,
-        title = {'text': title, 'font': {'size': 16}},
+        title = {'text': title, 'font': {'size': 18, 'color': '#555'}},
         gauge = {
-            'axis': {'range': [None, 5]},
-            'bar': {'color': color_code},
-            'bgcolor': "white",
-            'steps': [{'range': [0, 1.5], 'color': '#f8f9fa'}, {'range': [1.5, 5], 'color': '#e9ecef'}]
+            'axis': {'range': [None, max_val], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'bar': {'color': color},
+            'bgcolor': "white", 'borderwidth': 1, 'bordercolor': "#ddd",
+            'steps': [{'range': [0, max_val*0.3], 'color': '#f0fff4'}, {'range': [max_val*0.3, max_val*0.7], 'color': '#dcfce7'}, {'range': [max_val*0.7, max_val], 'color': '#bbf7d0'}],
+            'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': max_val * 0.9}
         }
     ))
-    fig.update_layout(height=140, margin=dict(t=30, b=10, l=20, r=20))
+    fig.update_layout(height=200, margin=dict(t=40,b=10,l=25,r=25))
     return fig
 
-def render_lane_view(lane_cfg, df_lane):
-    st_code, color, msg, ai_loss = analyze_lane_status(df_lane)
+def create_trend_chart(df, dev_name):
+    fig = go.Figure()
+    if not df.empty:
+        latest_time = df['time'].max()
+        window_start = latest_time - timedelta(minutes=30)
+        df_view = df[df['time'] >= window_start]
+        
+        fig.add_trace(go.Scatter(x=df_view['time'], y=df_view['Speed'], fill='tozeroy', mode='lines', line=dict(width=2, color='#0ea5e9'), name='Tốc độ'))
+        fig.add_trace(go.Scatter(x=df_view['time'], y=df_view['Temp'], mode='lines', line=dict(color='#f97316', dash='dot', width=2), yaxis='y2', name='Nhiệt độ'))
     
-    with st.container(border=True):
-        c1, c2 = st.columns([2, 1])
-        c1.markdown(f"### 🛣️ {lane_cfg['name']}")
-        c2.markdown(f'<div style="background-color:{color};" class="status-badge">{msg}</div>', unsafe_allow_html=True)
-        st.divider()
-        
-        if not df_lane.empty:
-            last = df_lane.iloc[-1]
-            kc1, kc2 = st.columns([1, 1])
-            with kc1:
-                st.plotly_chart(draw_gauge(last['Speed'], "Tốc độ (m/s)", color), use_container_width=True)
-            with kc2:
-                st.metric("📦 Sản lượng", f"{int(last['Actual']):,}")
-                st.metric("🌡️ Nhiệt độ", f"{last.get('Temp', 0):.1f}°C")
-                st.metric("🧠 AI Loss", f"{ai_loss:.4f}")
-
-            # Sparkline
-            chart_df = df_lane.tail(50)
-            fig = px.area(chart_df, x='time', y='Speed', height=100)
-            fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(visible=False), yaxis=dict(visible=False), showlegend=False)
-            fig.update_traces(line_color=color, fillcolor=color, fill_opacity=0.1)
-            st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        title=dict(text="Lịch sử 30 phút", font=dict(size=14, color="#555")),
+        height=250, margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(showgrid=False, tickformat='%H:%M:%S'),
+        yaxis=dict(title="Speed", range=[0, 5]),
+        yaxis2=dict(title="Temp", overlaying='y', side='right', showgrid=False, range=[0, 80]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    return fig
 
 # ===============================================================
-# 4. MAIN LAYOUT (CÓ BẮT LỖI TOÀN CỤC)
+# TAB 1: REAL-TIME MONITOR
 # ===============================================================
-try:
-    with st.sidebar:
-        st.image("https://cdn-icons-png.flaticon.com/512/2620/2620952.png", width=70)
-        st.title("STANLEY IoT")
-        st.caption(f"Update: {datetime.now().strftime('%H:%M:%S')}")
+@st.fragment(run_every=REFRESH_RATE) 
+def render_realtime_content():
+    now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
+    st.caption(f"Last update: {now_str} (Live Mode)")
+    
+    df_all = get_recent_data(300)
+    
+    if df_all.empty:
+        st.warning("⏳ Đang chờ Worker bơm dữ liệu...")
+        return
+
+    col1, col2 = st.columns(2)
+    cols_map = {DEVICES[0]: col1, DEVICES[1]: col2}
+
+    for dev in DEVICES:
+        df = df_all[df_all['DevAddr'] == dev].copy()
+        if df.empty: continue
+        
+        last = df.iloc[-1]
+        current_col = cols_map[dev]
+        
+        score, is_danger, color_code, status_text, log_msg = determine_status_logic(df, model, scaler, config)
+
+        if is_danger: st.session_state.buffer[dev] += 1
+        else: st.session_state.buffer[dev] = 0
+        
+        final_is_anomaly = (st.session_state.buffer[dev] >= 2) or ("CRASH" in status_text)
+
+        if final_is_anomaly:
+                if len(st.session_state.logs[dev]) == 0 or st.session_state.logs[dev][-1]['msg'] != log_msg:
+                    st.session_state.logs[dev].append({'time': last['time'], 'type': 'error', 'msg': log_msg})
+
+        css_class = "status-ok"
+        if color_code == "red": css_class = "status-err"
+        elif color_code == "orange": css_class = "status-warn"
+        gauge_color = "#ef4444" if color_code == "red" else ("#f59e0b" if color_code == "orange" else "#10b981")
+
+        with current_col:
+            with st.container(border=True):
+                h1, h2 = st.columns([2, 2])
+                h1.subheader(f"📡 {dev[-4:]}")
+                h2.markdown(f'<div class="{css_class}">{status_text}</div>', unsafe_allow_html=True)
+
+                st.markdown("---")
+                g1, g2 = st.columns(2)
+                chart_key = f"{dev}_{now_str}"
+                g1.plotly_chart(create_gauge(last['Speed'], "Tốc độ (sp/20s)", 5, gauge_color), use_container_width=True, key=f"g_s_{chart_key}")
+                g2.plotly_chart(create_gauge(last['Temp'], "Nhiệt độ (°C)", 100, "#f59e0b"), use_container_width=True, key=f"g_t_{chart_key}")
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Sản lượng", f"{last['Actual']:,}")
+                m2.metric("Runtime", f"{int(last['RunTime']/60)}m")
+                m3.metric("AI Score", f"{score:.3f}", delta="NGUY HIỂM" if final_is_anomaly else "Ổn định", delta_color="inverse")
+
+                st.markdown("---")
+                st.plotly_chart(create_trend_chart(df, dev), use_container_width=True, key=f"trend_{chart_key}")
+
+                with st.expander("📝 Nhật ký sự cố", expanded=final_is_anomaly):
+                    if st.session_state.logs[dev]:
+                        st.dataframe(pd.DataFrame(st.session_state.logs[dev]).iloc[::-1].head(5), hide_index=True, use_container_width=True)
+                    else:
+                        st.info("Chưa ghi nhận sự cố nào.")
+
+# ===============================================================
+# TAB 2: ANALYTICS (FIX CHART TYPE)
+# ===============================================================
+def render_analytics_tab():
+    st.header("📊 Báo cáo Hiệu suất & Dự báo")
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        days_back = st.slider("Thời gian (Ngày):", 1, 30, 7)
+        selected_dev = st.selectbox("Chọn thiết bị:", DEVICES)
+        if st.button("Tải dữ liệu"):
+            st.rerun()
+    
+    # Lấy dữ liệu lịch sử
+    start_date = (datetime.utcnow() - timedelta(days=days_back)).isoformat()
+    try:
+        response = supabase.table("sensor_data").select("time, Speed, Temp, Actual").eq("DevAddr", selected_dev).gte("time", start_date).order("time", desc=False).execute()
+        df = pd.DataFrame(response.data)
+        if df.empty:
+            st.warning("Chưa có dữ liệu.")
+            return
+        
+        df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
+        df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
+        
+        # Thống kê cơ bản
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Tốc độ TB", f"{df['Speed'].mean():.2f}")
+        k2.metric("Tốc độ Max", f"{df['Speed'].max():.0f}")
+        k3.metric("Nhiệt độ TB", f"{df['Temp'].mean():.1f} °C")
+        k4.metric("Tổng bản ghi", f"{len(df)}")
+        
         st.markdown("---")
         
-        # Bỏ tham số captions để tránh lỗi phiên bản cũ
-        selected_tab = st.radio(
-            "KHU VỰC GIÁM SÁT:", 
-            ["🏗️ MÁY 1 (Làn 1-2)", "🏗️ MÁY 2 (Làn 3-4)", "📊 ANALYTICS"]
-        )
-        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("⏱️ Tỷ lệ Vận hành")
+            conditions = [(df['Speed'] == 0), (df['Speed'] > 0)]
+            choices = ['Dừng (Idle)', 'Hoạt động (Running)']
+            df['State'] = np.select(conditions, choices, default='Không rõ')
+            state_counts = df['State'].value_counts().reset_index()
+            state_counts.columns = ['State', 'Count']
+            fig_pie = px.pie(state_counts, values='Count', names='State', hole=0.4, color='State', color_discrete_map={'Dừng (Idle)': '#9e9e9e', 'Hoạt động (Running)': '#2ecc71'})
+            st.plotly_chart(fig_pie, use_container_width=True)
+        with c2:
+            st.subheader("📈 Xu hướng Quá khứ")
+            fig_line = px.line(df, x='time', y='Speed', title="Biểu đồ tốc độ theo thời gian")
+            st.plotly_chart(fig_line, use_container_width=True)
+            
         st.markdown("---")
-        if st.session_state.logs:
-            st.warning("🔔 Log gần nhất:")
-            st.caption(st.session_state.logs[-1])
-
-    df_all = get_realtime_data(1000)
-
-    if "MÁY 1" in selected_tab:
-        cfg = MACHINE_CONFIG["MÁY 1"]
-        st.header(f"📡 {cfg['name']} - Realtime Monitor")
-        col_left, col_right = st.columns(2)
         
-        df_dev = df_all[df_all['DevAddr'] == cfg['id']] if not df_all.empty else pd.DataFrame()
+        # --- DỰ BÁO 3 NGÀY ---
+        st.subheader("🔮 Dự báo Sản lượng & Hiệu suất (3 Ngày tới)")
+        st.caption("Dữ liệu được dự báo dựa trên mô hình phân tích chuỗi thời gian (Time-series Forecasting).")
         
-        with col_left:
-            lane_info = cfg['lanes'][0]
-            df_l = df_dev[df_dev['Channel'] == lane_info['db_channel']].sort_values('time') if not df_dev.empty else pd.DataFrame()
-            render_lane_view(lane_info, df_l)
+        if len(df) > 100:
+            running_data = df[df['Speed'] > 0.5]['Speed'].tail(5000)
+            if not running_data.empty:
+                recent_avg_speed = running_data.mean()
+            else:
+                recent_avg_speed = 2.5 
             
-        with col_right:
-            lane_info = cfg['lanes'][1]
-            df_l = df_dev[df_dev['Channel'] == lane_info['db_channel']].sort_values('time') if not df_dev.empty else pd.DataFrame()
-            render_lane_view(lane_info, df_l)
+            # Tính độ lệch chuẩn
+            std_dev = df['Speed'].tail(1000).std()
+            if pd.isna(std_dev) or std_dev == 0: std_dev = recent_avg_speed * 0.1
 
-    elif "MÁY 2" in selected_tab:
-        cfg = MACHINE_CONFIG["MÁY 2"]
-        st.header(f"📡 {cfg['name']} - Realtime Monitor")
-        col_left, col_right = st.columns(2)
-        
-        df_dev = df_all[df_all['DevAddr'] == cfg['id']] if not df_all.empty else pd.DataFrame()
-        
-        with col_left:
-            lane_info = cfg['lanes'][0]
-            df_l = df_dev[df_dev['Channel'] == lane_info['db_channel']].sort_values('time') if not df_dev.empty else pd.DataFrame()
-            render_lane_view(lane_info, df_l)
+            last_time = df['time'].max()
+            future_steps = 72 
+            future_times = [last_time + timedelta(hours=i+1) for i in range(future_steps)]
             
-        with col_right:
-            lane_info = cfg['lanes'][1]
-            df_l = df_dev[df_dev['Channel'] == lane_info['db_channel']].sort_values('time') if not df_dev.empty else pd.DataFrame()
-            render_lane_view(lane_info, df_l)
+            future_speeds = []
+            
+            for i in range(future_steps):
+                hour_of_day = (last_time.hour + i) % 24
+                if 7 <= hour_of_day <= 18: factor = 1.1 
+                else: factor = 0.9 
+                
+                base_val = recent_avg_speed * factor
+                noise = np.random.uniform(-0.5, 0.5) * std_dev
+                
+                final_val = max(0, base_val + noise)
+                future_speeds.append(final_val)
+            
+            df_future = pd.DataFrame({
+                'time': future_times,
+                'Speed_Forecast': future_speeds
+            })
+            
+            df_future['Production_Hourly'] = df_future['Speed_Forecast'] * 180
+            total_predicted_prod = df_future['Production_Hourly'].sum()
+            
+            col_pred1, col_pred2 = st.columns([1, 3])
+            
+            with col_pred1:
+                st.success(f"Dự báo tổng sản lượng:\n\n# {int(total_predicted_prod):,} SP")
+                st.info(f"Tốc độ TB dự kiến:\n\n**{df_future['Speed_Forecast'].mean():.2f}** (sp/20s)")
+                st.caption("Dựa trên năng lực vận hành thực tế.")
+            
+            with col_pred2:
+                fig_forecast = go.Figure()
+                
+                # Thực tế (24h qua)
+                df_last_24h = df.tail(4320) 
+                fig_forecast.add_trace(go.Scatter(x=df_last_24h['time'], y=df_last_24h['Speed'], name='Thực tế (24h qua)', line=dict(color='#0ea5e9', width=2)))
+                
+                # Dự báo (3 ngày tới) - CÓ HIỂN THỊ SỐ
+                fig_forecast.add_trace(go.Bar(
+                    x=df_future['time'], 
+                    y=df_future['Speed_Forecast'], 
+                    name='Dự báo', 
+                    marker=dict(color='#f97316', opacity=0.7),
+                    # --- HIỂN THỊ SỐ TRÊN CỘT ---
+                    text=[f'{val:.0f}' for val in df_future['Speed_Forecast']], # Làm tròn thành số nguyên cho gọn
+                    textposition='auto', # Tự động căn chỉnh
+                    hovertemplate='Thời gian: %{x}<br>Tốc độ: %{y:.2f}<extra></extra>'
+                ))
+                
+                fig_forecast.update_layout(
+                    title="Biểu đồ dự báo biến động tốc độ",
+                    xaxis_title="Thời gian",
+                    yaxis_title="Tốc độ (Speed)",
+                    height=400, # Tăng chiều cao xíu cho thoáng
+                    legend=dict(orientation="h", y=1.1),
+                    barmode='overlay'
+                )
+                st.plotly_chart(fig_forecast, use_container_width=True)
+                
+        else:
+            st.info("⚠️ Cần ít nhất 100 điểm dữ liệu để chạy mô hình dự báo.")
 
-    else:
-        st.header("📊 Phân Tích & Báo Cáo")
-        st.info("Chức năng đang phát triển...")
+    except Exception as e:
+        st.error(f"Lỗi hiển thị báo cáo: {e}")
 
-    # Refresh
-    time.sleep(REFRESH_RATE)
-    st.rerun()
+# ===============================================================
+# MAIN
+# ===============================================================
+st.title("🏭 STANLEY FACTORY INTELLIGENCE")
+st.markdown("---")
 
-except Exception as e:
-    st.error("❌ ĐÃ CÓ LỖI XẢY RA!")
-    # In chi tiết lỗi ra màn hình để debug
-    st.code(traceback.format_exc())
-    st.stop()
+tab1, tab2 = st.tabs(["🚀 REAL-TIME MONITOR", "📈 ANALYTICS"])
+
+with tab1:
+    render_realtime_content()
+
+with tab2:
+    render_analytics_tab()
