@@ -14,47 +14,30 @@ from supabase import create_client
 # ===============================================================
 # 1. CẤU HÌNH GIAO DIỆN & KẾT NỐI
 # ===============================================================
-# layout="wide" là yếu tố quan trọng nhất để giao diện trải ngang
 st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# --- CSS LÀM ĐẸP TAB NGANG ---
+# CSS: Tùy chỉnh giao diện Sidebar và Card
 st.markdown("""
 <style>
-    /* 1. Tùy chỉnh thanh Tab nằm ngang cho to và rõ */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
+    /* Chỉnh lại font size cho Sidebar */
+    [data-testid="stSidebar"] {
         background-color: #f8f9fa;
-        padding: 10px;
-        border-radius: 10px;
+    }
+    .stRadio [data-testid="stMarkdownContainer"] > p {
+        font-size: 18px; /* Chữ menu to hơn */
+        font-weight: 600;
+        padding-top: 10px;
+        padding-bottom: 10px;
     }
     
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        background-color: #ffffff;
-        border-radius: 8px;
-        color: #495057;
-        font-weight: 600;
-        font-size: 16px; /* Chữ to dễ đọc */
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        flex-grow: 1; /* Tự động giãn đều chiều ngang */
-        justify-content: center;
-    }
-
-    /* Khi Tab được chọn */
-    .stTabs [aria-selected="true"] {
-        background-color: #007bff !important;
-        color: #ffffff !important;
-        box-shadow: 0 4px 6px rgba(0,123,255,0.3);
-    }
-
-    /* 2. Style cho Card (Khung Làn) */
+    /* Status Badges */
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #badbcc; }
     .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #f5c2c7; }
     .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #ffeeba; }
     .status-gray { background-color: #e2e3e5; color: #41464b; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #d3d6d8; }
     
-    div[data-testid="stMetricValue"] { font-size: 20px !important; color: #333; }
+    /* Metrics font */
+    div[data-testid="stMetricValue"] { font-size: 24px !important; color: #333; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -140,11 +123,9 @@ def predict_anomaly(df_lane, model, scaler, config):
         data_segment = df_lane[features].tail(SEQ_LEN + 1).values
         data_log = np.log1p(data_segment)
         data_scaled = scaler.transform(data_log)
-        
         X_input = torch.tensor(data_scaled[:-1], dtype=torch.float32).unsqueeze(0)
         with torch.no_grad(): Y_pred = model(X_input).numpy()[0]
         Y_actual = data_scaled[-1]
-        
         target_idx = config.get('target_cols_idx', [0, 1, 2])
         loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
         return loss, loss > config['threshold']
@@ -152,19 +133,16 @@ def predict_anomaly(df_lane, model, scaler, config):
 
 def determine_status(df_lane):
     if df_lane.empty: return 0.0, False, "gray", "NO DATA", "Chờ dữ liệu..."
-    
     last = df_lane.iloc[-1]
-    # Check Offline
+    
     if (datetime.now() - last['time']).total_seconds() > 180:
         return 0.0, False, "orange", "⚠️ MẤT KẾT NỐI", "Offline > 3 phút"
     
-    # Check Dừng
     if last['Speed'] == 0:
         if last.get('Temp', 0) > TEMP_CRASH_THRESHOLD:
             return 9.9, True, "red", "⛔ CRASH", f"Nhiệt cao: {last['Temp']}°C"
         return 0.0, False, "gray", "💤 IDLE", "Máy đang nghỉ"
 
-    # Check AI
     if model:
         loss, is_anom = predict_anomaly(df_lane, model, scaler, config)
         if is_anom:
@@ -181,7 +159,7 @@ def determine_status(df_lane):
 def create_gauge(val, title, color):
     fig = go.Figure(go.Indicator(
         mode = "gauge+number", value = val,
-        title = {'text': title, 'font': {'size': 15}},
+        title = {'text': title, 'font': {'size': 18}},
         gauge = {
             'axis': {'range': [None, 5], 'tickwidth': 1},
             'bar': {'color': color},
@@ -189,13 +167,11 @@ def create_gauge(val, title, color):
             'steps': [{'range': [0, 1.5], 'color': '#f0fff4'}, {'range': [1.5, 3.5], 'color': '#dcfce7'}]
         }
     ))
-    fig.update_layout(height=140, margin=dict(t=30,b=10,l=20,r=20))
+    fig.update_layout(height=160, margin=dict(t=30,b=10,l=20,r=20))
     return fig
 
 def render_lane_card(dev_id, ch, df_lane):
-    """Vẽ 1 Làn"""
     now_str = datetime.now().strftime('%H:%M:%S')
-    
     if df_lane.empty:
         st.warning(f"Làn {ch}: Chưa có dữ liệu")
         return
@@ -244,26 +220,37 @@ def render_lane_card(dev_id, ch, df_lane):
             else: st.caption("Ổn định.")
 
 # ===============================================================
-# 4. MAIN LAYOUT (TAB NGANG)
+# 4. MAIN LAYOUT (SIDEBAR MENU)
 # ===============================================================
-st.title("🏭 STANLEY FACTORY INTELLIGENCE")
-
-# Các TAB nằm ngang
-tab1, tab2, tab3 = st.tabs([
-    f"🏗️ MÁY 1 ({DEVICES[0][-4:]})", 
-    f"🏗️ MÁY 2 ({DEVICES[1][-4:]})", 
-    "📊 ANALYTICS"
-])
+# TẠO MENU BÊN TRÁI
+with st.sidebar:
+    st.title("🏭 DASHBOARD")
+    st.markdown("---")
+    
+    # Menu chọn dạng Radio nhưng nhìn giống nút bấm
+    selected_page = st.radio(
+        "CHỌN KHU VỰC:",
+        [
+            f"🏗️ MÁY 1\n({DEVICES[0][-4:]})", 
+            f"🏗️ MÁY 2\n({DEVICES[1][-4:]})", 
+            "📊 ANALYTICS"
+        ],
+        index=0
+    )
+    
+    st.markdown("---")
+    st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')}")
 
 # Lấy dữ liệu 1 lần
 df_all = get_recent_data(1000)
 
-# --- TAB 1 ---
-with tab1:
+# --- TRANG MÁY 1 ---
+if "MÁY 1" in selected_page:
+    st.header(f"📡 Giám sát Realtime: {DEVICES[0]}")
     if not df_all.empty:
         col_left, col_right = st.columns(2)
         dev = DEVICES[0]
-        # Lấy data và render song song
+        
         df_l1 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "01")].sort_values('time')
         df_l2 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "02")].sort_values('time')
         
@@ -271,8 +258,9 @@ with tab1:
         with col_right: render_lane_card(dev, "02", df_l2)
     else: st.info("⏳ Đang tải dữ liệu Máy 1...")
 
-# --- TAB 2 ---
-with tab2:
+# --- TRANG MÁY 2 ---
+elif "MÁY 2" in selected_page:
+    st.header(f"📡 Giám sát Realtime: {DEVICES[1]}")
     if not df_all.empty:
         col_left, col_right = st.columns(2)
         dev = DEVICES[1]
@@ -284,12 +272,12 @@ with tab2:
         with col_right: render_lane_card(dev, "02", df_l2)
     else: st.info("⏳ Đang tải dữ liệu Máy 2...")
 
-# --- TAB 3 ---
-with tab3:
+# --- TRANG ANALYTICS ---
+elif "ANALYTICS" in selected_page:
     st.header("📊 Phân tích & Báo cáo")
     c_sel, _ = st.columns([1, 2])
     with c_sel:
-        otp = st.selectbox("Chọn Làn:", [f"{d[-4:]} - Làn {c}" for d in DEVICES for c in CHANNELS])
+        otp = st.selectbox("Chọn Làn để xem:", [f"{d[-4:]} - Làn {c}" for d in DEVICES for c in CHANNELS])
         days = st.slider("Thời gian:", 1, 30, 7)
         btn = st.button("Tải dữ liệu")
     
@@ -312,5 +300,6 @@ with tab3:
             st.plotly_chart(px.histogram(df_his, x='Speed', title="Phân bố tốc độ"), use_container_width=True)
         else: st.warning("Không có dữ liệu.")
 
+# Refresh
 time.sleep(REFRESH_RATE)
 st.rerun()
