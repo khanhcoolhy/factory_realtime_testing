@@ -12,26 +12,49 @@ from datetime import datetime, timedelta
 from supabase import create_client
 
 # ===============================================================
-# 1. CẤU HÌNH & KẾT NỐI
+# 1. CẤU HÌNH GIAO DIỆN & KẾT NỐI
 # ===============================================================
-st.set_page_config(page_title="Stanley Factory Monitor - 4 Lanes", layout="wide", page_icon="🏭")
+# layout="wide" là yếu tố quan trọng nhất để giao diện trải ngang
+st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# CSS: Tùy chỉnh giao diện Tab và Card cho đẹp
+# --- CSS LÀM ĐẸP TAB NGANG ---
 st.markdown("""
 <style>
-    /* Trạng thái */
+    /* 1. Tùy chỉnh thanh Tab nằm ngang cho to và rõ */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background-color: #f8f9fa;
+        padding: 10px;
+        border-radius: 10px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        white-space: pre-wrap;
+        background-color: #ffffff;
+        border-radius: 8px;
+        color: #495057;
+        font-weight: 600;
+        font-size: 16px; /* Chữ to dễ đọc */
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        flex-grow: 1; /* Tự động giãn đều chiều ngang */
+        justify-content: center;
+    }
+
+    /* Khi Tab được chọn */
+    .stTabs [aria-selected="true"] {
+        background-color: #007bff !important;
+        color: #ffffff !important;
+        box-shadow: 0 4px 6px rgba(0,123,255,0.3);
+    }
+
+    /* 2. Style cho Card (Khung Làn) */
     .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #badbcc; }
     .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #f5c2c7; }
     .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #ffeeba; }
     .status-gray { background-color: #e2e3e5; color: #41464b; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #d3d6d8; }
     
-    /* Font số to */
-    div[data-testid="stMetricValue"] { font-size: 22px !important; color: #333; }
-    
-    /* Tabs Design */
-    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
-    .stTabs [data-baseweb="tab"] { height: 50px; background-color: #ffffff; border-radius: 8px 8px 0px 0px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-    .stTabs [aria-selected="true"] { background-color: #e6f3ff; border-top: 3px solid #007bff; color: #007bff; font-weight: bold; }
+    div[data-testid="stMetricValue"] { font-size: 20px !important; color: #333; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -61,7 +84,6 @@ supabase = init_connection()
 # --- LOAD AI MODEL ---
 @st.cache_resource
 def load_ai():
-    # Hỗ trợ tìm model ở nhiều vị trí (local hoặc server)
     m_path = MODEL_PATH if os.path.exists(MODEL_PATH) else "lstm_factory_v2.pth"
     s_path = SCALER_PATH if os.path.exists(SCALER_PATH) else "robust_scaler_v2.pkl"
     c_path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "model_config_v2.pkl"
@@ -97,7 +119,7 @@ if 'init' not in st.session_state:
     st.session_state.init = True
 
 # ===============================================================
-# 2. XỬ LÝ DỮ LIỆU & AI
+# 2. XỬ LÝ DỮ LIỆU
 # ===============================================================
 def get_recent_data(limit=1000): 
     try:
@@ -133,7 +155,7 @@ def determine_status(df_lane):
     
     last = df_lane.iloc[-1]
     # Check Offline
-    if (datetime.now() - last['time']).total_seconds() > 180: # 3 phút
+    if (datetime.now() - last['time']).total_seconds() > 180:
         return 0.0, False, "orange", "⚠️ MẤT KẾT NỐI", "Offline > 3 phút"
     
     # Check Dừng
@@ -154,7 +176,7 @@ def determine_status(df_lane):
     return 0.0, False, "gray", "LOADING", "Loading AI..."
 
 # ===============================================================
-# 3. UI COMPONENTS (RENDER CARD)
+# 3. UI COMPONENTS
 # ===============================================================
 def create_gauge(val, title, color):
     fig = go.Figure(go.Indicator(
@@ -171,7 +193,7 @@ def create_gauge(val, title, color):
     return fig
 
 def render_lane_card(dev_id, ch, df_lane):
-    """Hiển thị 1 Làn dưới dạng Card"""
+    """Vẽ 1 Làn"""
     now_str = datetime.now().strftime('%H:%M:%S')
     
     if df_lane.empty:
@@ -181,62 +203,52 @@ def render_lane_card(dev_id, ch, df_lane):
     last = df_lane.iloc[-1]
     score, is_danger, color, status_text, log_msg = determine_status(df_lane)
 
-    # Buffer Alert
     key = (dev_id, ch)
     if is_danger: st.session_state.buffer[key] += 1
     else: st.session_state.buffer[key] = 0
     final_alert = (st.session_state.buffer[key] >= 2) or ("CRASH" in status_text)
 
-    # Log
     if final_alert:
         if not st.session_state.logs[key] or st.session_state.logs[key][-1]['msg'] != log_msg:
             st.session_state.logs[key].append({'time': last['time'], 'msg': log_msg})
 
-    # Render UI
     css = "status-ok" if color == "green" else ("status-err" if color == "red" else ("status-warn" if color == "orange" else "status-gray"))
     gauge_col = "#10b981" if color == "green" else ("#ef4444" if color == "red" else "#f59e0b")
 
+    # CARD UI
     with st.container(border=True):
-        # Header Làn
-        c1, c2 = st.columns([1, 1])
+        c1, c2 = st.columns([1.5, 1])
         c1.markdown(f"#### 🛣️ Làn {ch}")
         c2.markdown(f'<div class="{css}" style="text-align:center">{status_text}</div>', unsafe_allow_html=True)
-        
         st.divider()
-        
-        # Chỉ số chính
         g_col, m_col = st.columns([1, 1.2])
         with g_col:
             st.plotly_chart(create_gauge(last['Speed'], "Tốc độ", gauge_col), use_container_width=True, key=f"g_{dev_id}_{ch}_{now_str}")
         with m_col:
-            st.markdown(f"📦 **Sản lượng:** `{int(last['Actual']):,}`")
-            st.markdown(f"⏱️ **Runtime:** `{int(last.get('RunTime',0)/60)}p`")
-            st.markdown(f"🌡️ **Nhiệt độ:** `{last.get('Temp',0):.1f}°C`")
-            st.markdown(f"🧠 **AI Loss:** `{score:.3f}`")
-
+            st.markdown(f"📦 **SL:** `{int(last['Actual']):,}`")
+            st.markdown(f"⏱️ **Run:** `{int(last.get('RunTime',0)/60)}p`")
+            st.markdown(f"🌡️ **Temp:** `{last.get('Temp',0):.1f}°C`")
+            st.markdown(f"🧠 **Loss:** `{score:.3f}`")
+        
         # Sparkline
         chart_data = df_lane.tail(50)
-        fig = px.line(chart_data, x='time', y='Speed', height=150)
-        fig.update_layout(
-            margin=dict(l=0,r=0,t=0,b=0), 
-            xaxis=dict(showgrid=False, visible=False), 
-            yaxis=dict(showgrid=True, range=[0, 5], visible=True)
-        )
+        fig = px.line(chart_data, x='time', y='Speed', height=120)
+        fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(visible=False), yaxis=dict(visible=True, range=[0, 5]))
         st.plotly_chart(fig, use_container_width=True, key=f"c_{dev_id}_{ch}_{now_str}")
 
-        # Logs
-        with st.expander("📝 Nhật ký lỗi", expanded=final_alert):
+        with st.expander("📝 Nhật ký", expanded=final_alert):
             if st.session_state.logs[key]:
                 l_df = pd.DataFrame(st.session_state.logs[key])
                 l_df['time'] = l_df['time'].dt.strftime('%H:%M:%S')
                 st.dataframe(l_df.iloc[::-1].head(5), hide_index=True, use_container_width=True)
-            else: st.caption("Hệ thống ổn định.")
+            else: st.caption("Ổn định.")
 
 # ===============================================================
-# 4. MAIN LAYOUT (3 TABS)
+# 4. MAIN LAYOUT (TAB NGANG)
 # ===============================================================
 st.title("🏭 STANLEY FACTORY INTELLIGENCE")
 
+# Các TAB nằm ngang
 tab1, tab2, tab3 = st.tabs([
     f"🏗️ MÁY 1 ({DEVICES[0][-4:]})", 
     f"🏗️ MÁY 2 ({DEVICES[1][-4:]})", 
@@ -246,13 +258,12 @@ tab1, tab2, tab3 = st.tabs([
 # Lấy dữ liệu 1 lần
 df_all = get_recent_data(1000)
 
-# --- TAB MÁY 1 (HIỆN CẢ 2 LÀN SONG SONG) ---
+# --- TAB 1 ---
 with tab1:
     if not df_all.empty:
         col_left, col_right = st.columns(2)
         dev = DEVICES[0]
-        
-        # Lọc dữ liệu riêng cho từng làn
+        # Lấy data và render song song
         df_l1 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "01")].sort_values('time')
         df_l2 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "02")].sort_values('time')
         
@@ -260,13 +271,12 @@ with tab1:
         with col_right: render_lane_card(dev, "02", df_l2)
     else: st.info("⏳ Đang tải dữ liệu Máy 1...")
 
-# --- TAB MÁY 2 (HIỆN CẢ 2 LÀN SONG SONG) ---
+# --- TAB 2 ---
 with tab2:
     if not df_all.empty:
         col_left, col_right = st.columns(2)
         dev = DEVICES[1]
         
-        # Lọc dữ liệu riêng cho từng làn
         df_l1 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "01")].sort_values('time')
         df_l2 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "02")].sort_values('time')
         
@@ -274,15 +284,13 @@ with tab2:
         with col_right: render_lane_card(dev, "02", df_l2)
     else: st.info("⏳ Đang tải dữ liệu Máy 2...")
 
-# --- TAB ANALYTICS ---
+# --- TAB 3 ---
 with tab3:
-    st.header("📊 Phân tích hiệu suất")
-    
+    st.header("📊 Phân tích & Báo cáo")
     c_sel, _ = st.columns([1, 2])
     with c_sel:
-        # Selector chọn cụ thể Làn
-        otp = st.selectbox("Chọn Làn để xem:", [f"{d[-4:]} - Làn {c}" for d in DEVICES for c in CHANNELS])
-        days = st.slider("Thời gian (ngày):", 1, 30, 7)
+        otp = st.selectbox("Chọn Làn:", [f"{d[-4:]} - Làn {c}" for d in DEVICES for c in CHANNELS])
+        days = st.slider("Thời gian:", 1, 30, 7)
         btn = st.button("Tải dữ liệu")
     
     if btn:
@@ -296,17 +304,13 @@ with tab3:
         
         if not df_his.empty:
             df_his['time'] = pd.to_datetime(df_his['time']).dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
-            
             k1, k2, k3 = st.columns(3)
-            k1.metric("Tốc độ TB", f"{df_his['Speed'].mean():.2f}")
-            k2.metric("Tổng Sản lượng", f"{df_his['Actual'].max() - df_his['Actual'].min():,}")
+            k1.metric("Speed TB", f"{df_his['Speed'].mean():.2f}")
+            k2.metric("Tổng SL", f"{df_his['Actual'].max() - df_his['Actual'].min():,}")
             k3.metric("Số bản ghi", f"{len(df_his)}")
-            
             st.plotly_chart(px.line(df_his, x='time', y='Speed', title=f"Biểu đồ Tốc độ: {otp}"), use_container_width=True)
             st.plotly_chart(px.histogram(df_his, x='Speed', title="Phân bố tốc độ"), use_container_width=True)
-        else:
-            st.warning("Không có dữ liệu lịch sử.")
+        else: st.warning("Không có dữ liệu.")
 
-# Refresh
 time.sleep(REFRESH_RATE)
 st.rerun()
