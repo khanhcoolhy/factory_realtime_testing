@@ -1,4 +1,5 @@
 import os
+import time
 import pandas as pd
 import numpy as np
 import torch
@@ -11,16 +12,22 @@ from datetime import datetime, timedelta
 # ===============================================================
 # 1. CẤU HÌNH & KHỞI TẠO
 # ===============================================================
-print("🕵️ MONITOR: Khởi động hệ thống giám sát Backend (4 LANES)...")
+print("🕵️ MONITOR: Khởi động hệ thống giám sát Backend (Mapping Làn 1-4)...")
 
-# Cập nhật đường dẫn theo cấu trúc thư mục của Notebook
 MODEL_PATH = "saved_models_v2/lstm_factory_v2.pth"
 SCALER_PATH = "saved_models_v2/robust_scaler_v2.pkl"
 CONFIG_PATH = "saved_models_v2/model_config_v2.pkl"
 
-# Danh sách Cặp (Máy, Làn) cần giám sát
-DEVICES = ["4417930D77DA", "AC0BFBCE8797"]
-CHANNELS = ["01", "02"] # 4 Làn tổng cộng
+# --- MAPPING CẤU HÌNH (SỬA PHẦN NÀY ĐỂ KHỚP APP) ---
+# Logic: Ánh xạ từ (Device ID + Channel vật lý) -> Tên Làn hiển thị
+LANE_MAPPING = {
+    "4417930D77DA": {"01": "Làn 1", "02": "Làn 2"},  # Máy 1
+    "AC0BFBCE8797": {"01": "Làn 3", "02": "Làn 4"}   # Máy 2
+}
+
+# Lấy danh sách để loop
+DEVICES = list(LANE_MAPPING.keys())
+CHANNELS = ["01", "02"] # Channel vật lý từ DB
 
 TEMP_CRASH_THRESHOLD = 40.0 
 
@@ -31,31 +38,25 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("❌ Lỗi: Thiếu Key SUPABASE!")
-    exit(1)
+    print("❌ Lỗi: Thiếu Key Supabase (Set environment variable)")
+    exit()
 
 try:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
-    print(f"❌ Lỗi kết nối Supabase: {e}")
-    exit(1)
+    print(f"❌ Lỗi kết nối DB: {e}")
+    exit()
 
 # ===============================================================
-# 2. LOAD AI MODEL
+# 2. LOAD AI MODEL (Giống hệt Notebook & App)
 # ===============================================================
 def load_ai():
-    # Fallback đường dẫn nếu chạy local hoặc server
-    m_path = MODEL_PATH if os.path.exists(MODEL_PATH) else "lstm_factory_v2.pth"
-    s_path = SCALER_PATH if os.path.exists(SCALER_PATH) else "robust_scaler_v2.pkl"
-    c_path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "model_config_v2.pkl"
-
-    if not os.path.exists(m_path): 
-        print(f"❌ Không tìm thấy model tại {m_path}")
+    if not os.path.exists(MODEL_PATH):
+        print("⚠️ Không tìm thấy file model. Chạy chế độ Rule-based.")
         return None, None, None
-    
     try:
-        cfg = joblib.load(c_path)
-        scl = joblib.load(s_path)
+        cfg = joblib.load(CONFIG_PATH)
+        scl = joblib.load(SCALER_PATH)
         
         class LSTMModel(nn.Module):
             def __init__(self, n_features, hidden_dim=128, num_layers=3, dropout=0.2):
@@ -68,129 +69,129 @@ def load_ai():
                 return out
 
         model = LSTMModel(n_features=cfg['n_features'], hidden_dim=cfg['hidden_dim'])
-        model.load_state_dict(torch.load(m_path, map_location='cpu'))
+        model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
         model.eval()
-        
-        print("✅ Đã load xong Model AI (4 Lanes Ready).")
+        print("✅ Đã load xong AI Model v2")
         return model, scl, cfg
     except Exception as e:
-        print(f"❌ Lỗi khi load AI Model: {e}")
+        print(f"❌ Lỗi load AI: {e}")
         return None, None, None
 
 model, scaler, config = load_ai()
 
 # ===============================================================
-# 3. HÀM GỬI TELEGRAM
+# 3. HÀM XỬ LÝ
 # ===============================================================
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("   [Log] Chưa cấu hình Telegram.")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=5)
-    except: pass
-
-# ===============================================================
-# 4. LOGIC KIỂM TRA (PER LANE)
-# ===============================================================
-def check_lane_status(dev_id, channel):
-    print(f"\n🔍 Đang kiểm tra: {dev_id} - Kênh {channel}...")
-    
-    try:
-        # 1. Query Supabase: Lọc cả DevAddr VÀ Channel
-        response = supabase.table("sensor_data")\
-            .select("*")\
-            .eq("DevAddr", dev_id)\
-            .eq("Channel", channel)\
-            .order("time", desc=True)\
-            .limit(40)\
-            .execute()
-            
-        df = pd.DataFrame(response.data)
-        
-        if df.empty: 
-            print("   -> ⚠️ Không có dữ liệu.")
-            return
-        
-        df['time'] = pd.to_datetime(df['time'])
-        df = df.sort_values('time') # Quan trọng: Sort đúng thứ tự cho LSTM
-        last_row = df.iloc[-1]
-        
-        # 2. Staleness Check
-        now_utc = datetime.utcnow()
-        last_time_utc = last_row['time'].replace(tzinfo=None)
-        if (now_utc - last_time_utc).total_seconds() > 1500:
-            print(f"   -> 💤 Dữ liệu cũ. Bỏ qua.")
-            return
-
-        # 3. Rule Based Check (Crash)
-        if last_row['Speed'] == 0:
-            if last_row.get('Temp', 0) > TEMP_CRASH_THRESHOLD:
-                msg = (
-                    f"🚨 **CẢNH BÁO CRASH - LÀN {channel}**\n"
-                    f"---------------\n"
-                    f"🤖 Máy: `{dev_id}`\n"
-                    f"🔥 Nhiệt độ: **{last_row['Temp']}°C**\n"
-                    f"🛑 Tốc độ: 0\n"
-                    f"🕒 Lúc: {last_row['time'].strftime('%H:%M:%S')}\n"
-                    f"⚠️ *Dừng đột ngột, nhiệt độ cao!*"
-                )
-                print("   -> 🔴 PHÁT HIỆN CRASH!")
-                send_telegram(msg)
-            else:
-                print("   -> 💤 Máy nghỉ (Idle).")
-            return 
-
-        # 4. AI Anomaly Detection
-        SEQ_LEN = 30
-        if len(df) < SEQ_LEN + 1:
-            print("   -> ⚠️ Chưa đủ dữ liệu để chạy AI.")
-            return
-            
-        if model is None: return
-
-        features = config['features_list']
-        data_segment = df[features].tail(SEQ_LEN + 1).values
-        
-        # Log Transform & Scale (Phải khớp Notebook)
-        data_log = np.log1p(data_segment)
-        data_scaled = scaler.transform(data_log)
-        
-        X_input = torch.tensor(data_scaled[:-1], dtype=torch.float32).unsqueeze(0)
-        Y_actual = data_scaled[-1]
-        
-        with torch.no_grad():
-            Y_pred = model(X_input).numpy()[0]
-        
-        target_idx = config.get('target_cols_idx', [0, 1, 2])
-        loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
-        
-        if loss > config['threshold']:
-            err_type = "🐢 Kẹt tải / Chậm" if last_row['Speed'] < 1.5 else "⚠️ Quá tải / Rung"
-            msg = (
-                f"⚠️ **BẤT THƯỜNG AI - LÀN {channel}**\n"
-                f"---------------\n"
-                f"🤖 Máy: `{dev_id[-4:]}`\n"
-                f"📉 Loss: **{loss:.3f}** (Limit: {config['threshold']:.2f})\n"
-                f"🔧 Lỗi: {err_type}\n"
-                f"🏎️ Speed: {last_row['Speed']}\n"
-            )
-            print(f"   -> 🟠 BẤT THƯỜNG AI (Loss: {loss:.3f})")
-            send_telegram(msg)
-        else:
-            print(f"   -> ✅ Ổn định (Loss: {loss:.3f})")
-
     except Exception as e:
-        print(f"❌ Lỗi xử lý {dev_id}-{channel}: {e}")
+        print(f"❌ Lỗi gửi Telegram: {e}")
+
+def check_system():
+    print(f"\n--- Quét lúc {datetime.now().strftime('%H:%M:%S')} ---")
+    
+    # Lấy dữ liệu mới nhất (đủ cho 4 làn)
+    try:
+        response = supabase.table("sensor_data").select("*").order("time", desc=True).limit(500).execute()
+        df = pd.DataFrame(response.data)
+        if df.empty:
+            print("⚠️ Không có dữ liệu.")
+            return
+        
+        # Convert Time
+        df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
+        # Sort để lấy tail chính xác
+        df = df.sort_values('time')
+    except Exception as e:
+        print(f"❌ Lỗi query DB: {e}")
+        return
+
+    # Loop qua từng thiết bị và từng kênh
+    for dev_id in DEVICES:
+        for ch in CHANNELS:
+            # Lấy tên hiển thị (Làn 1, 2, 3, 4)
+            lane_name = LANE_MAPPING.get(dev_id, {}).get(ch, f"Unknown-{ch}")
+            
+            # Lọc data cho làn này
+            df_lane = df[(df['DevAddr'] == dev_id) & (df['Channel'] == ch)]
+            
+            if df_lane.empty:
+                continue
+                
+            last_row = df_lane.iloc[-1]
+            
+            # --- KIỂM TRA LOGIC ---
+            
+            # 1. Offline Check
+            time_diff = (datetime.now(last_row['time'].tzinfo) - last_row['time']).total_seconds()
+            if time_diff > 300: # 5 phút
+                print(f"⚠️ {lane_name}: Mất kết nối ({int(time_diff)}s)")
+                # (Tùy chọn: Gửi cảnh báo offline)
+                continue
+
+            # 2. Rule-based Crash Check (Quan trọng)
+            if last_row['Speed'] == 0 and last_row['Temp'] > TEMP_CRASH_THRESHOLD:
+                msg = (
+                    f"🔥 **CẢNH BÁO NGUY HIỂM - {lane_name}**\n"
+                    f"---------------\n"
+                    f"🌡️ Nhiệt độ: {last_row['Temp']}°C (Quá cao)\n"
+                    f"🛑 Trạng thái: Dừng máy đột ngột\n"
+                    f"⏰ Thời gian: {last_row['time'].strftime('%H:%M:%S')}"
+                )
+                print(f"   -> 🔴 {lane_name}: CRASH DETECTED!")
+                send_telegram(msg)
+                continue # Đã crash thì không check AI nữa
+
+            # 3. AI Anomaly Check
+            if model and len(df_lane) > 31: # Cần đủ sequence length
+                try:
+                    features = config['features_list']
+                    data_segment = df_lane[features].tail(31).values
+                    
+                    # Preprocessing giống Training
+                    data_log = np.log1p(data_segment)
+                    data_scaled = scaler.transform(data_log)
+                    
+                    X_input = torch.tensor(data_scaled[:-1], dtype=torch.float32).unsqueeze(0)
+                    Y_actual = data_scaled[-1]
+                    
+                    with torch.no_grad():
+                        Y_pred = model(X_input).numpy()[0]
+                    
+                    target_idx = config.get('target_cols_idx', [0, 1, 2])
+                    loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
+                    
+                    # Ngưỡng (Threshold)
+                    threshold = config['threshold']
+                    
+                    if loss > threshold:
+                        err_type = "🐢 Kẹt tải / Chậm" if last_row['Speed'] < 1.5 else "⚠️ Rung lắc / Quá tải"
+                        msg = (
+                            f"🤖 **PHÁT HIỆN BẤT THƯỜNG - {lane_name}**\n"
+                            f"---------------\n"
+                            f"📉 AI Loss: **{loss:.4f}** (Ngưỡng: {threshold:.3f})\n"
+                            f"🔧 Phán đoán: {err_type}\n"
+                            f"🏎️ Tốc độ: {last_row['Speed']} m/s\n"
+                            f"🌡️ Nhiệt độ: {last_row['Temp']}°C"
+                        )
+                        print(f"   -> 🟠 {lane_name}: AI ANOMALY (Loss: {loss:.3f})")
+                        send_telegram(msg)
+                    else:
+                        print(f"   -> ✅ {lane_name}: Ổn định (Loss: {loss:.3f})")
+                        
+                except Exception as e:
+                    print(f"   -> ⚠️ Lỗi tính toán AI cho {lane_name}: {e}")
 
 # ===============================================================
-# 5. MAIN LOOP
+# 4. LOOP CHÍNH
 # ===============================================================
 if __name__ == "__main__":
-    # Duyệt qua từng Máy và từng Làn
-    for dev in DEVICES:
-        for ch in CHANNELS:
-            check_lane_status(dev, ch)
-    
-    print("\n🏁 Hoàn tất kiểm tra 4 Làn.")
+    while True:
+        check_system()
+        time.sleep(10) # 10 giây quét 1 lần
