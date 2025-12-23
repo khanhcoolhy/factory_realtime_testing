@@ -19,9 +19,10 @@ st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_ico
 
 st.markdown("""
 <style>
-    .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; }
-    .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #f5c2c7; display: inline-block; }
-    .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #ffeeba; display: inline-block; }
+    .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #badbcc; display: inline-block; font-size: 0.9rem;}
+    .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #f5c2c7; display: inline-block; animation: blinker 1s linear infinite; font-size: 0.9rem;}
+    .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-weight: 600; border: 1px solid #ffeeba; display: inline-block; font-size: 0.9rem;}
+    @keyframes blinker { 50% { opacity: 0.6; } }
     div[data-testid="stMetricValue"] { font-size: 24px; color: #333; }
     h3 { font-size: 1.1rem !important; font-weight: 700 !important; color: #444; }
     .block-container { padding-top: 2rem; }
@@ -32,7 +33,7 @@ MODEL_PATH = "lstm_factory_v2.pth"
 SCALER_PATH = "robust_scaler_v2.pkl"
 CONFIG_PATH = "model_config_v2.pkl"
 
-# --- [FIX UI 1] CẤU HÌNH DISPLAY CHO TỪNG MÁY & LÀN ---
+# --- CẤU HÌNH DISPLAY CHO TỪNG MÁY & LÀN ---
 DEVICES_CONFIG = [
     {"id": "4417930D77DA", "name": "MÁY MMM 01", "channels": ["01", "02"]},
     {"id": "AC0BFBCE8797", "name": "MÁY MMM 02", "channels": ["01", "02"]}
@@ -81,7 +82,7 @@ def load_ai():
 
 model, scaler, config = load_ai()
 
-# --- [FIX STATE] State Management cho từng Làn ---
+# --- State Management cho từng Làn ---
 if 'status' not in st.session_state:
     st.session_state.buffer = {} # Key sẽ là "DevID_Channel"
     st.session_state.logs = {}   # Key sẽ là "DevID_Channel"
@@ -135,7 +136,6 @@ def determine_status_logic(df_device, model, scaler, config):
     prev_row = df_device.iloc[-2]
     
     time_diff = (last_row['time'] - prev_row['time']).total_seconds()
-    # Tăng time check lên chút vì dữ liệu gửi mỗi 20s
     if time_diff > 120:
         return 0.0, False, "orange", "⚠️ SYNC LAG", f"Mất kết nối {int(time_diff)}s"
 
@@ -144,7 +144,7 @@ def determine_status_logic(df_device, model, scaler, config):
 
     if speed == 0:
         if temp > TEMP_CRASH_THRESHOLD:
-            return 9.99, True, "red", "⛔ CRASH", f"Dừng đột ngột! Temp: {temp}°C"
+            return 9.99, True, "red", "⛔ CRASH", f"CRASH! Temp: {temp}°C"
         else:
             return 0.0, False, "gray", "💤 IDLE", "Máy đang nghỉ"
 
@@ -152,7 +152,7 @@ def determine_status_logic(df_device, model, scaler, config):
         loss, is_anomaly = predict_anomaly(df_device, model, scaler, config)
         if is_anomaly:
             if speed < 1.5:
-                 return loss, True, "orange", "🐢 SLOW/JAM", f"Tải thấp/Kẹt (Loss: {loss:.2f})"
+                 return loss, True, "orange", "🐢 SLOW", f"Kẹt/Tải thấp (Loss: {loss:.2f})"
             else:
                  return loss, True, "red", "⚠️ OVERLOAD", f"Quá tải (Loss: {loss:.2f})"
         else:
@@ -197,21 +197,20 @@ def create_trend_chart(df, title_suffix):
     return fig
 
 # ===============================================================
-# TAB 1: REAL-TIME MONITOR (ĐÃ SỬA UI)
+# TAB 1: REAL-TIME MONITOR
 # ===============================================================
 @st.fragment(run_every=REFRESH_RATE) 
 def render_realtime_content():
     now_str = (datetime.utcnow() + timedelta(hours=7)).strftime('%H:%M:%S')
     st.caption(f"Last update: {now_str} (Live Mode)")
     
-    # Lấy dữ liệu 1 lần cho tối ưu
     df_all = get_recent_data(500)
     
     if df_all.empty:
         st.warning("⏳ Đang chờ Worker bơm dữ liệu...")
         return
 
-    # --- [FIX UI 2] Loop qua từng Device, rồi loop qua từng Channel ---
+    # Loop qua từng Device
     for dev_conf in DEVICES_CONFIG:
         d_id = dev_conf['id']
         d_name = dev_conf['name']
@@ -219,21 +218,18 @@ def render_realtime_content():
         
         st.subheader(f"🏭 {d_name} ({d_id[-4:]})")
         
-        # Tạo số cột tương ứng với số kênh (Làn)
         cols = st.columns(len(channels))
         
         for idx, ch in enumerate(channels):
             with cols[idx]:
-                # Tạo khóa duy nhất cho lane này
                 lane_key = f"{d_id}_{ch}"
                 
-                # Init Session State cho lane nếu chưa có
+                # Init Session State
                 if lane_key not in st.session_state.buffer:
                     st.session_state.buffer[lane_key] = 0
                     st.session_state.logs[lane_key] = []
 
-                # --- [QUAN TRỌNG] Filter dữ liệu CHỈ CỦA CHANNEL NÀY ---
-                # Đây là bước sửa lỗi biểu đồ zig-zag
+                # Filter dữ liệu
                 df_lane = df_all[
                     (df_all['DevAddr'] == d_id) & 
                     (df_all['Channel'] == ch)
@@ -263,8 +259,8 @@ def render_realtime_content():
                 # --- VẼ GIAO DIỆN CHO 1 LANE ---
                 with st.container(border=True):
                     # Header Lane
-                    c1, c2 = st.columns([2, 2])
-                    c1.markdown(f"**Làn (Lane) {ch}**")
+                    c1, c2 = st.columns([1, 2])
+                    c1.markdown(f"**Làn {ch}**")
                     c2.markdown(f'<div class="{css_class}">{status_text}</div>', unsafe_allow_html=True)
                     
                     if not df_lane.empty:
@@ -282,9 +278,17 @@ def render_realtime_content():
                         # Biểu đồ Trend nhỏ
                         st.plotly_chart(create_trend_chart(df_lane, f"Làn {ch}"), use_container_width=True, key=f"tr_{chart_id}")
                         
-                        # Log sự cố
-                        if final_is_anomaly:
-                            st.error(f"⚠️ {log_msg}")
+                        # --- [NEW CODE] KHU VỰC NHẬT KÝ LỖI ---
+                        with st.expander(f"📝 Nhật ký Làn {ch} ({len(st.session_state.logs[lane_key])})", expanded=final_is_anomaly):
+                            if st.session_state.logs[lane_key]:
+                                # Chuyển list thành DataFrame để hiển thị đẹp
+                                log_df = pd.DataFrame(st.session_state.logs[lane_key])
+                                # Đảo ngược để lỗi mới nhất lên đầu
+                                log_df = log_df.iloc[::-1]
+                                st.dataframe(log_df, hide_index=True, use_container_width=True)
+                            else:
+                                st.info("✅ Chưa ghi nhận sự cố nào.")
+                        # --------------------------------------
 
                     else:
                         st.info("Chưa có dữ liệu làn này")
@@ -292,21 +296,18 @@ def render_realtime_content():
         st.markdown("---") # Ngăn cách giữa các máy
 
 # ===============================================================
-# TAB 2: ANALYTICS (ĐÃ SỬA CHỌN LANE)
+# TAB 2: ANALYTICS
 # ===============================================================
 def render_analytics_tab():
     st.header("📊 Báo cáo Hiệu suất & Dự báo")
     
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
-        # Chọn Máy (Hiển thị tên cho đẹp)
         dev_options = {d['name']: d['id'] for d in DEVICES_CONFIG}
         selected_name = st.selectbox("Chọn thiết bị:", list(dev_options.keys()))
         selected_dev_id = dev_options[selected_name]
     
     with col2:
-        # Chọn Làn (Dynamic theo máy)
-        # Tìm config của máy đang chọn
         curr_conf = next(item for item in DEVICES_CONFIG if item["id"] == selected_dev_id)
         selected_channel = st.selectbox("Chọn Làn (Channel):", curr_conf['channels'])
 
@@ -333,7 +334,6 @@ def render_analytics_tab():
         df['time'] = pd.to_datetime(df['time'], format='mixed', utc=True)
         df['time'] = df['time'].dt.tz_convert('Asia/Bangkok').dt.tz_localize(None)
         
-        # --- PHẦN DƯỚI GIỮ NGUYÊN LOGIC CŨ NHƯNG DATA ĐÃ SẠCH ---
         # Thống kê cơ bản
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Tốc độ TB", f"{df['Speed'].mean():.2f}")
@@ -360,7 +360,7 @@ def render_analytics_tab():
             
         st.markdown("---")
         
-        # --- DỰ BÁO 3 NGÀY (GIỮ NGUYÊN LOGIC) ---
+        # --- DỰ BÁO 3 NGÀY ---
         st.subheader(f"🔮 Dự báo Làn {selected_channel} (3 Ngày tới)")
         
         if len(df) > 100:
