@@ -14,30 +14,30 @@ from supabase import create_client
 # ===============================================================
 # 1. CẤU HÌNH & KẾT NỐI
 # ===============================================================
-st.set_page_config(page_title="Stanley Monitor", layout="wide", page_icon="🏭")
+st.set_page_config(page_title="Stanley Factory Monitor", layout="wide", page_icon="🏭")
 
-# CSS: Tùy chỉnh Sidebar & Card cho đẹp
+# CSS: Tùy chỉnh giao diện
 st.markdown("""
 <style>
-    /* Chỉnh Menu bên trái to và rõ hơn */
+    /* Làm đẹp Sidebar (Menu trái) */
     [data-testid="stSidebar"] {
-        background-color: #f0f2f6;
+        background-color: #f8f9fa;
         padding-top: 20px;
     }
     .stRadio [data-testid="stMarkdownContainer"] > p {
-        font-size: 18px;
+        font-size: 16px;
         font-weight: 600;
-        padding: 10px 0px;
+        padding: 8px 0px;
     }
     
     /* Status Badge */
-    .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #badbcc; }
-    .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #f5c2c7; }
-    .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #ffeeba; }
-    .status-gray { background-color: #e2e3e5; color: #41464b; padding: 4px 12px; border-radius: 12px; font-weight: 700; border: 1px solid #d3d6d8; }
+    .status-ok { background-color: #d1e7dd; color: #0f5132; padding: 4px 12px; border-radius: 8px; font-weight: 700; border: 1px solid #badbcc; }
+    .status-err { background-color: #f8d7da; color: #842029; padding: 4px 12px; border-radius: 8px; font-weight: 700; border: 1px solid #f5c2c7; }
+    .status-warn { background-color: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 8px; font-weight: 700; border: 1px solid #ffeeba; }
+    .status-gray { background-color: #e2e3e5; color: #41464b; padding: 4px 12px; border-radius: 8px; font-weight: 700; border: 1px solid #d3d6d8; }
     
     /* Font số liệu to */
-    div[data-testid="stMetricValue"] { font-size: 26px !important; color: #333; }
+    div[data-testid="stMetricValue"] { font-size: 24px !important; color: #333; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -56,7 +56,7 @@ try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 except:
-    st.error("❌ Lỗi: Thiếu Secrets!")
+    st.error("❌ Lỗi: Thiếu Secrets SUPABASE_URL hoặc SUPABASE_KEY")
     st.stop()
 
 @st.cache_resource
@@ -76,6 +76,7 @@ def load_ai():
     try:
         cfg = joblib.load(c_path)
         scl = joblib.load(s_path)
+        
         class LSTMModel(nn.Module):
             def __init__(self, n_features, hidden_dim=128, num_layers=3, dropout=0.2):
                 super(LSTMModel, self).__init__()
@@ -85,6 +86,7 @@ def load_ai():
                 out, _ = self.lstm(x)
                 out = self.fc(out[:, -1, :])
                 return out
+
         model = LSTMModel(n_features=cfg['n_features'], hidden_dim=cfg['hidden_dim'])
         model.load_state_dict(torch.load(m_path, map_location='cpu'))
         model.eval()
@@ -121,11 +123,9 @@ def predict_anomaly(df_lane, model, scaler, config):
         data_segment = df_lane[features].tail(SEQ_LEN + 1).values
         data_log = np.log1p(data_segment)
         data_scaled = scaler.transform(data_log)
-        
         X_input = torch.tensor(data_scaled[:-1], dtype=torch.float32).unsqueeze(0)
         with torch.no_grad(): Y_pred = model(X_input).numpy()[0]
         Y_actual = data_scaled[-1]
-        
         target_idx = config.get('target_cols_idx', [0, 1, 2])
         loss = np.mean(np.abs(Y_pred[target_idx] - Y_actual[target_idx]))
         return loss, loss > config['threshold']
@@ -153,7 +153,7 @@ def determine_status(df_lane):
     return 0.0, False, "gray", "LOADING", "Loading AI..."
 
 # ===============================================================
-# 3. UI COMPONENTS
+# 3. UI COMPONENTS (CARD HIỂN THỊ)
 # ===============================================================
 def create_gauge(val, title, color):
     fig = go.Figure(go.Indicator(
@@ -192,15 +192,15 @@ def render_lane_card(dev_id, ch, df_lane):
     css = "status-ok" if color == "green" else ("status-err" if color == "red" else ("status-warn" if color == "orange" else "status-gray"))
     gauge_col = "#10b981" if color == "green" else ("#ef4444" if color == "red" else "#f59e0b")
 
-    # CARD UI
+    # CARD UI CÓ VIỀN
     with st.container(border=True):
-        # Header Làn
+        # 1. Header: Tên Làn & Trạng thái
         c1, c2 = st.columns([1, 1])
-        c1.markdown(f"### 🛣️ LÀN {ch}")
+        c1.markdown(f"#### 🛣️ LÀN {ch}")
         c2.markdown(f'<div class="{css}" style="text-align:center">{status_text}</div>', unsafe_allow_html=True)
         st.divider()
         
-        # Chỉ số & Đồng hồ
+        # 2. Đồng hồ & Chỉ số
         g_col, m_col = st.columns([1, 1.2])
         with g_col:
             st.plotly_chart(create_gauge(last['Speed'], "Tốc độ", gauge_col), use_container_width=True, key=f"g_{dev_id}_{ch}_{now_str}")
@@ -210,13 +210,13 @@ def render_lane_card(dev_id, ch, df_lane):
             st.markdown(f"🌡️ **Temp:** `{last.get('Temp',0):.1f}°C`")
             st.markdown(f"🧠 **AI:** `{score:.3f}`")
         
-        # Biểu đồ nhỏ
+        # 3. Biểu đồ nhỏ
         chart_data = df_lane.tail(50)
         fig = px.line(chart_data, x='time', y='Speed', height=130)
         fig.update_layout(margin=dict(l=0,r=0,t=0,b=0), xaxis=dict(visible=False), yaxis=dict(visible=True, range=[0, 5]))
         st.plotly_chart(fig, use_container_width=True, key=f"c_{dev_id}_{ch}_{now_str}")
 
-        # Logs
+        # 4. Logs
         with st.expander("📝 Nhật ký", expanded=final_alert):
             if st.session_state.logs[key]:
                 l_df = pd.DataFrame(st.session_state.logs[key])
@@ -225,18 +225,18 @@ def render_lane_card(dev_id, ch, df_lane):
             else: st.caption("Hệ thống ổn định.")
 
 # ===============================================================
-# 4. MAIN LAYOUT (SIDEBAR MENU)
+# 4. MAIN LAYOUT (SIDEBAR MENU + SONG SONG)
 # ===============================================================
 
-# 1. TẠO MENU BÊN TRÁI (SIDEBAR)
+# --- A. MENU BÊN TRÁI ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/3061/3061341.png", width=60)
     st.title("STANLEY IOT")
     st.markdown("---")
     
-    # Menu chọn dạng Radio
+    # Menu chọn (Radio Button đóng vai trò Tab dọc)
     page = st.radio(
-        "KHU VỰC GIÁM SÁT:",
+        "CHỌN MÁY / CHỨC NĂNG:",
         [
             "🏗️ MÁY 1 (77DA)", 
             "🏗️ MÁY 2 (8797)", 
@@ -247,18 +247,19 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"Last update: {datetime.now().strftime('%H:%M:%S')}")
 
-# Load dữ liệu chung
+# Load dữ liệu chung 1 lần
 df_all = get_recent_data(1000)
 
-# 2. XỬ LÝ HIỂN THỊ DỰA TRÊN MENU ĐÃ CHỌN
-# (Lưu ý: Không dùng st.tabs nữa, thay vào đó là if/elif check page)
+# --- B. HIỂN THỊ NỘI DUNG CHÍNH ---
 
-# --- TRANG MÁY 1 ---
+# === TRƯỜNG HỢP 1: MÁY 1 ===
 if "MÁY 1" in page:
     st.header(f"📡 Dashboard Realtime: {DEVICES[0]}")
+    st.markdown("---")
+    
     if not df_all.empty:
-        # TẠO 2 CỘT ĐỐI XỨNG (SYMMETRICAL)
-        col1, col2 = st.columns(2)
+        # CHIA ĐÔI MÀN HÌNH: Cột Trái (Làn 01) - Cột Phải (Làn 02)
+        col_left, col_right = st.columns(2)
         dev = DEVICES[0]
         
         # Lọc dữ liệu
@@ -266,28 +267,37 @@ if "MÁY 1" in page:
         df_l2 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "02")].sort_values('time')
         
         # Render song song
-        with col1: render_lane_card(dev, "01", df_l1)
-        with col2: render_lane_card(dev, "02", df_l2)
-    else: st.info("⏳ Đang tải dữ liệu Máy 1...")
+        with col_left: 
+            render_lane_card(dev, "01", df_l1)
+        with col_right: 
+            render_lane_card(dev, "02", df_l2)
+    else: 
+        st.info("⏳ Đang tải dữ liệu Máy 1...")
 
-# --- TRANG MÁY 2 ---
+# === TRƯỜNG HỢP 2: MÁY 2 ===
 elif "MÁY 2" in page:
     st.header(f"📡 Dashboard Realtime: {DEVICES[1]}")
+    st.markdown("---")
+    
     if not df_all.empty:
-        # TẠO 2 CỘT ĐỐI XỨNG
-        col1, col2 = st.columns(2)
+        # CHIA ĐÔI MÀN HÌNH: Cột Trái (Làn 01) - Cột Phải (Làn 02)
+        col_left, col_right = st.columns(2)
         dev = DEVICES[1]
         
         df_l1 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "01")].sort_values('time')
         df_l2 = df_all[(df_all['DevAddr'] == dev) & (df_all['Channel'] == "02")].sort_values('time')
         
-        with col1: render_lane_card(dev, "01", df_l1)
-        with col2: render_lane_card(dev, "02", df_l2)
-    else: st.info("⏳ Đang tải dữ liệu Máy 2...")
+        with col_left: 
+            render_lane_card(dev, "01", df_l1)
+        with col_right: 
+            render_lane_card(dev, "02", df_l2)
+    else: 
+        st.info("⏳ Đang tải dữ liệu Máy 2...")
 
-# --- TRANG ANALYTICS ---
+# === TRƯỜNG HỢP 3: ANALYTICS ===
 elif "ANALYTICS" in page:
     st.header("📊 Phân tích & Báo cáo")
+    st.markdown("---")
     
     c_sel, _ = st.columns([1, 2])
     with c_sel:
